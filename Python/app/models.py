@@ -1,12 +1,19 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.types import TypeDecorator
 
 from app.database import Base
+
+
+
+def utc_now() -> datetime:
+    """Current UTC time as a naive datetime -- the same value the deprecated
+    datetime.utcnow() returned, which is what every DateTime column here stores."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class BitBoolean(TypeDecorator):
@@ -80,7 +87,7 @@ class Complaint(Base):
     tenant_name = Column(String(255), nullable=True)
     description = Column(Text, nullable=True)
     status = Column(String(50), nullable=True)
-    created_date = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_date = Column(DateTime, default=utc_now, nullable=False)
     resolution_comment = Column(Text, nullable=True)
     closed_date = Column(DateTime, nullable=True)
 
@@ -94,7 +101,7 @@ class Occupant(Base):
     aadhar_file_name = Column(String(255), nullable=True)
     aadhar_content_type = Column(String(255), nullable=True)
     aadhar_storage_path = Column(String(500), nullable=True)
-    uploaded_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    uploaded_at = Column(DateTime, default=utc_now, nullable=False)
     verified = Column(BitBoolean, default=False, nullable=False)
     verified_by = Column(String(255), nullable=True)
     verified_at = Column(DateTime, nullable=True)
@@ -116,7 +123,7 @@ class DepositPayment(Base):
     source = Column(String(20), nullable=False)  # "razorpay" or "manual"
     payment_id = Column(String(255), nullable=True)
     notes = Column(String(500), nullable=True)
-    paid_date = Column(DateTime, default=datetime.utcnow, nullable=False)
+    paid_date = Column(DateTime, default=utc_now, nullable=False)
 
 
 class TransactionLog(Base):
@@ -127,4 +134,4 @@ class TransactionLog(Base):
     payment_id = Column(String(255), nullable=True)
     status = Column(String(50), nullable=True)
     error_reason = Column(Text, nullable=True)
-    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
+    timestamp = Column(DateTime, default=utc_now, nullable=False)

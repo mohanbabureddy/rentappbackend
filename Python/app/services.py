@@ -11,7 +11,7 @@ import bcrypt
 import requests
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from app.models import Complaint, DepositPayment, Occupant, TenantBill, TransactionLog, User
+from app.models import Complaint, DepositPayment, Occupant, TenantBill, TransactionLog, User, utc_now
 from app.repositories import ComplaintRepository, DepositRepository, OccupantRepository, TenantBillRepository, TransactionLogRepository, UserRepository
 
 UPLOADS_ROOT = Path(__file__).resolve().parents[1] / "uploads"
@@ -56,7 +56,7 @@ def fetch_uploaded_file(relative_path: str):
 
 def to_iso_utc(dt: Optional[datetime]) -> Optional[str]:
     """Serialize a datetime for the API with an explicit UTC marker. Every timestamp in
-    this app is set via datetime.utcnow(), which is naive (no tzinfo) -- plain
+    this app is set via utc_now(), which is naive (no tzinfo) -- plain
     dt.isoformat() then produces a string with no timezone indicator at all. The
     browser's `new Date(str)` parses such a string as local time instead of UTC, so
     timestamps render shifted by the viewer's UTC offset (e.g. ~5:30h off in IST).
@@ -286,7 +286,7 @@ class TenantBillService:
             self.logger.warning("Mark-paid failed: bill %s not found.", bill_id)
             raise ValueError("Bill not found")
         bill.paid = True
-        bill.paid_date = datetime.utcnow()
+        bill.paid_date = utc_now()
         self.repo.save(bill)
         self.logger.info("Marked bill %s as paid for tenant %s (%s).", bill_id, bill.tenant_name, bill.month_year)
         if self.email_service is not None:
@@ -367,7 +367,7 @@ class ComplaintService:
 
     def create_complaint(self, complaint: Complaint) -> Complaint:
         complaint.status = "OPEN"
-        complaint.created_date = datetime.utcnow()
+        complaint.created_date = utc_now()
         complaint.closed_date = None
         complaint.resolution_comment = None
         saved = self.repo.save(complaint)
@@ -389,7 +389,7 @@ class ComplaintService:
             self.logger.info("Complaint %s is already closed; no action taken.", complaint_id)
             return complaint
         complaint.status = "CLOSED"
-        complaint.closed_date = datetime.utcnow()
+        complaint.closed_date = utc_now()
         if resolution_comment is not None:
             complaint.resolution_comment = resolution_comment.strip()
         saved = self.repo.save(complaint)
@@ -403,7 +403,7 @@ class ComplaintService:
         if complaint.status == "CLOSED":
             raise ValueError("This complaint is already closed")
         complaint.status = "CLOSED"
-        complaint.closed_date = datetime.utcnow()
+        complaint.closed_date = utc_now()
         complaint.resolution_comment = "Withdrawn by tenant"
         saved = self.repo.save(complaint)
         self.logger.info("Tenant %s withdrew complaint %s.", saved.tenant_name, complaint_id)
@@ -525,7 +525,7 @@ class OccupantService:
         if not occupant.verified:
             occupant.verified = True
             occupant.verified_by = "OWNER"
-            occupant.verified_at = datetime.utcnow()
+            occupant.verified_at = utc_now()
             self.repo.save(occupant)
             self.logger.info("Verified occupant %s ('%s') for tenant %s.", occupant_id, occupant.name, occupant.tenant_username)
         else:
