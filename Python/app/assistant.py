@@ -1,9 +1,10 @@
+import json
 import logging
 import os
 import re
 import time
 from datetime import timedelta
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import anthropic
 import requests
@@ -19,6 +20,33 @@ DEPOSIT_QUESTION = re.compile(r"deposit|advance", re.I)
 REFUND_QUESTION = re.compile(r"refund|withdraw|return|\bback\b", re.I)
 BILLS_QUESTION =re.compile(r"\bbills?\b|\bowe\b|\bdues?\b|outstanding|pending amount|unpaid|how much .*pay", re.I)
 IST_OFFSET = timedelta(hours=5, minutes=30)
+MAX_TOOL_ROUNDS = 3  # hard cap so a confused model can't loop forever (cost/latency safety)
+
+# The one tool the model can call for anything not already covered by the fixed
+# replies above (deposit/bills/refund questions never reach here at all). It can
+# only filter bills already loaded for the CURRENT, authenticated tenant -- there
+# is no "tenant" parameter, so the model has no way to ask for anyone else's data.
+GET_BILLS_TOOL = {
+    "name": "get_bills",
+    "description": (
+        "Look up this tenant's own bills, going further back than the recent summary "
+        "already given to you. Use this for anything about a specific past month, a "
+        "specific bill type, or a total across many months that isn't already answered above."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "month": {"type": "string", "description": "YYYY-MM, e.g. 2026-03. Omit for every month."},
+            "bill_type": {"type": "string", "enum": ["RENT", "ELECTRICITY"], "description": "Omit for both types."},
+        },
+    },
+}
+
+
+def _ollama_tool_format(tool: Dict[str, Any]) -> Dict[str, Any]:
+    return {"type": "function", "function": {
+        "name": tool["name"], "description": tool["description"], "parameters": tool["input_schema"],
+    }}
 
 
 def _rupees(amount) -> str:
@@ -45,23 +73,81 @@ class AssistantService:
         api_key = os.getenv("ANTHROPIC_API_KEY")
         self._client = anthropic.Anthropic(api_key=api_key) if api_key else None
 
-    def _ask_ollama(self, system_prompt: str, message: str) -> str:
+    @staticmethod
+    def _run_get_bills_tool(args: Dict[str, Any], bills: List[TenantBill]) -> str:
+        """Executes get_bills for real -- filters the CURRENT tenant's already-loaded
+        bills by whatever month/type the model asked for. There is no tenant argument
+        here at all, so this can never be pointed at another tenant's data."""
+        month = (args or {}).get("month") or None
+        bill_type = ((args or {}).get("bill_type") or "").upper() or None
+        matched = [b for b in bills if (not month or b.month_year == month) and (not bill_type or b.bill_type == bill_type)]
+        return json.dumps([
+            {
+                "month": b.month_year, "type": b.bill_type, "paid": b.paid,
+                "rent": b.rent, "water": b.water, "electricity": b.electricity, "miscellaneous": b.miscellaneous,
+                "total": (b.rent or 0) + (b.water or 0) + (b.electricity or 0) + (b.miscellaneous or 0),
+            }
+            for b in matched
+        ])
+
+    def _run_tool(self, name: str, args: Dict[str, Any], bills: List[TenantBill]) -> str:
+        if name == "get_bills":
+            return self._run_get_bills_tool(args, bills)
+        return json.dumps({"error": f"Unknown tool '{name}'"})
+
+    def _ask_ollama(self, system_prompt: str, message: str, bills: List[TenantBill], trace: List[str]) -> str:
         headers = {"Authorization": f"Bearer {self._ollama_api_key}"} if self._ollama_api_key else {}
-        resp = requests.post(
-            f"{self._ollama_url}/api/chat",
-            headers=headers,
-            json={
-                "model": self._ollama_model,
-                "stream": False,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": message},
-                ],
-            },
-            timeout=120,
-        )
-        resp.raise_for_status()
-        return resp.json().get("message", {}).get("content", "")
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": message},
+        ]
+        for _ in range(MAX_TOOL_ROUNDS):
+            resp = requests.post(
+                f"{self._ollama_url}/api/chat",
+                headers=headers,
+                json={
+                    "model": self._ollama_model,
+                    "stream": False,
+                    "messages": messages,
+                    "tools": [_ollama_tool_format(GET_BILLS_TOOL)],
+                },
+                timeout=120,
+            )
+            resp.raise_for_status()
+            msg = resp.json().get("message", {})
+            tool_calls = msg.get("tool_calls") or []
+            if not tool_calls:
+                return msg.get("content", "")
+            messages.append(msg)
+            for call in tool_calls:
+                fn = call.get("function", {})
+                trace.append(f"Model called tool: {fn.get('name')}({fn.get('arguments')})")
+                result = self._run_tool(fn.get("name"), fn.get("arguments") or {}, bills)
+                messages.append({"role": "tool", "content": result})
+        return "Sorry, I couldn't work out an answer to that."
+
+    def _ask_anthropic(self, system_prompt: str, message: str, bills: List[TenantBill], trace: List[str]) -> str:
+        messages: List[Dict[str, Any]] = [{"role": "user", "content": message}]
+        for _ in range(MAX_TOOL_ROUNDS):
+            response = self._client.messages.create(
+                model=MODEL,
+                max_tokens=1024,
+                system=system_prompt,
+                output_config={"effort": "low"},
+                tools=[GET_BILLS_TOOL],
+                messages=messages,
+            )
+            if response.stop_reason != "tool_use":
+                return next((block.text for block in response.content if block.type == "text"), "")
+            messages.append({"role": "assistant", "content": response.content})
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    trace.append(f"Model called tool: {block.name}({block.input})")
+                    result = self._run_tool(block.name, block.input, bills)
+                    tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
+            messages.append({"role": "user", "content": tool_results})
+        return "Sorry, I couldn't work out an answer to that."
 
     @staticmethod
     def _bill_line(b: TenantBill) -> str:
@@ -229,20 +315,13 @@ class AssistantService:
 
         logger.info("Assistant question from '%s': %s", username, message[:200])
         provider = f"Ollama model {self._ollama_model}" if self._provider == "ollama" else f"Anthropic model {MODEL}"
-        trace.append(f"Sending system prompt + question to {provider}")
+        trace.append(f"Sending system prompt + question to {provider}, with the get_bills tool available")
         started = time.monotonic()
         try:
             if self._provider == "ollama":
-                answer = self._ask_ollama(system_prompt, message.strip())
+                answer = self._ask_ollama(system_prompt, message.strip(), bills, trace)
             else:
-                response = self._client.messages.create(
-                    model=MODEL,
-                    max_tokens=1024,
-                    system=system_prompt,
-                    output_config={"effort": "low"},
-                    messages=[{"role": "user", "content": message.strip()}],
-                )
-                answer = next((block.text for block in response.content if block.type == "text"), "")
+                answer = self._ask_anthropic(system_prompt, message.strip(), bills, trace)
         except (anthropic.APIError, requests.RequestException):
             logger.exception("Assistant API call failed for '%s'.", username)
             raise RuntimeError("Assistant is temporarily unavailable. Please try again shortly.")
