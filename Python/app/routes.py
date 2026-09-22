@@ -89,8 +89,11 @@ def register_routes(app: Flask) -> None:
             return jsonify({"error": "Invalid credentials"}), 401
 
         LoginThrottle.record_success(username)
+        # Invalidates any token from an earlier login -- one signed-in device per account.
+        user.session_version = (user.session_version or 0) + 1
+        repo.save(user)
         logger.info("User '%s' logged in successfully (role=%s).", username, user.role)
-        token = generate_token(user.username, user.role)
+        token = generate_token(user.username, user.role, user.session_version)
         return jsonify({"role": user.role, "username": username, "token": token}), 200
 
     @app.route("/api/users/add", methods=["POST"])
@@ -237,8 +240,11 @@ def register_routes(app: Flask) -> None:
             return jsonify({"error": "Invalid credentials"}), 401
 
         LoginThrottle.record_success(username)
+        # Invalidates any token from an earlier login -- one signed-in device per account.
+        user.session_version = (user.session_version or 0) + 1
+        repo.save(user)
         logger.info("User '%s' logged in successfully (role=%s).", username, user.role)
-        token = generate_token(user.username, user.role)
+        token = generate_token(user.username, user.role, user.session_version)
         return jsonify({"username": user.username, "fullName": user.full_name, "role": user.role, "token": token}), 200
 
     @app.route("/api/users/forgot-password", methods=["POST"])

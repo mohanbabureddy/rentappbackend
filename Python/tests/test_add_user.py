@@ -17,8 +17,16 @@ def _post(body, role="ADMIN", saved=None, existing=None):
         saved.append(user)
         return user
 
-    repo = N(find_by_username=lambda u: existing, save=save)
-    with mock.patch("app.routes.UserRepository", return_value=repo), mock.patch("app.routes.get_db", return_value=object()):
+    # "someone" is the caller identified by the bearer token (checked by auth.py);
+    # `existing`/`save` model the target account the route itself looks up.
+    actor = N(username="someone", role=role, session_version=0)
+
+    def find_by_username(u):
+        return actor if u == "someone" else existing
+
+    repo = N(find_by_username=find_by_username, save=save)
+    with mock.patch("app.routes.UserRepository", return_value=repo), mock.patch("app.routes.get_db", return_value=object()), \
+         mock.patch("app.auth.UserRepository", return_value=repo), mock.patch("app.auth.get_db", return_value=object()):
         headers = {"Authorization": "Bearer " + generate_token("someone", role)}
         return flask_app.test_client().post("/api/users/add", json=body, headers=headers)
 

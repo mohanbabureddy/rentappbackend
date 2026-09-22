@@ -8,8 +8,12 @@ from app.auth import generate_token
 
 def _put(body, user, role="ADMIN"):
     """Calls PUT /api/users/<id> with a fake user repository (no real database)."""
-    repo = N(find_by_id=lambda i: user, save=lambda u: u)
-    with mock.patch("app.routes.UserRepository", return_value=repo), mock.patch("app.routes.get_db", return_value=object()):
+    # "someone" is the caller identified by the bearer token (checked by auth.py);
+    # `user` models the target account the route itself looks up by id.
+    actor = N(username="someone", role=role, session_version=0)
+    repo = N(find_by_id=lambda i: user, find_by_username=lambda u: actor, save=lambda u: u)
+    with mock.patch("app.routes.UserRepository", return_value=repo), mock.patch("app.routes.get_db", return_value=object()), \
+         mock.patch("app.auth.UserRepository", return_value=repo), mock.patch("app.auth.get_db", return_value=object()):
         headers = {"Authorization": "Bearer " + generate_token("someone", role)}
         return flask_app.test_client().put("/api/users/update/5", json=body, headers=headers)
 

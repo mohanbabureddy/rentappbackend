@@ -55,6 +55,10 @@ class User(Base):
     registration_completed = Column(BitBoolean, default=False, nullable=False)
     move_in_date = Column(Date, nullable=True)
     demanded_deposit = Column(Float, nullable=True)
+    # Bumped on every successful login; embedded in that login's token as "ver".
+    # A token whose "ver" no longer matches this column is from an earlier login
+    # and is rejected -- this is what limits an account to one signed-in device.
+    session_version = Column(Integer, default=0, nullable=False)
 
 
 class TenantBill(Base):

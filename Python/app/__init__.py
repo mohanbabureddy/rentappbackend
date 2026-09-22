@@ -107,6 +107,7 @@ _LATER_COLUMNS = [
     ("users", "full_name", "VARCHAR(100)"),
     ("users", "demanded_deposit", "DOUBLE PRECISION"),
     ("tenant_bills", "bill_type", "VARCHAR(20) NOT NULL DEFAULT 'RENT'"),
+    ("users", "session_version", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
