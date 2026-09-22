@@ -19,6 +19,10 @@ MODEL = "claude-opus-5"
 DEPOSIT_QUESTION = re.compile(r"deposit|advance", re.I)
 REFUND_QUESTION = re.compile(r"refund|withdraw|return|\bback\b", re.I)
 BILLS_QUESTION = re.compile(r"\bbills?\b|\bowe\b|\bdues?\b|outstanding|pending amount|unpaid|how much .*pay", re.I)
+# Specifically about what's still owed, not a plain "my bills" -- in that case the
+# reply should show only the unpaid bills, not also clutter it with already-paid
+# ones nobody asked about.
+UNPAID_ONLY_QUESTION = re.compile(r"\bunpaid\b|\bpending\b|\boutstanding\b|\bdue\b|\bowe\b", re.I)
 # A question that LOOKS like a simple "what are my bills" (matches BILLS_QUESTION
 # above) but is actually asking something specific -- a particular month, a
 # comparison, a superlative, an all-time question, or about a different tenant --
@@ -187,13 +191,15 @@ class AssistantService:
             parts.append(f"misc {_rupees(b.miscellaneous)}")
         return f"{b.month_year} Rent: {_rupees(total)} ({', '.join(parts)})"
 
-    def _bills_reply(self, bills: List[TenantBill]) -> str:
-        """Exact bill summary from the database (not model-generated)."""
+    def _bills_reply(self, bills: List[TenantBill], unpaid_only: bool = False) -> str:
+        """Exact bill summary from the database (not model-generated). `unpaid_only`
+        drops the "Recently paid" section -- someone who specifically asked for
+        unpaid/pending/due bills shouldn't have to read past ones they already paid."""
         if not bills:
             return "You have no bills yet."
         ordered = sorted(bills, key=lambda b: (b.month_year or "", b.bill_type or ""), reverse=True)
         unpaid = [b for b in ordered if not b.paid]
-        paid = [b for b in ordered if b.paid][:3]
+        paid = [] if unpaid_only else [b for b in ordered if b.paid][:3]
         lines = []
         if unpaid:
             due = sum((b.rent or 0) + (b.water or 0) + (b.electricity or 0) + (b.miscellaneous or 0) for b in unpaid)
@@ -348,8 +354,12 @@ class AssistantService:
         bills = self.bill_repo.find_by_tenant_name_order_by_month_desc(username)
         trace.append(f"Loaded {len(bills)} bill(s) for this tenant from the database")
         if BILLS_QUESTION.search(message) and not BILLS_TARGETED_QUESTION.search(message):
-            trace.append("Generic bills word found (and nothing more specific) -> exact reply built from the bills, no AI model used")
-            return self._bills_reply(bills), trace
+            unpaid_only = bool(UNPAID_ONLY_QUESTION.search(message))
+            trace.append(
+                f"Generic bills word found (and nothing more specific) -> exact reply built from the bills "
+                f"({'unpaid only' if unpaid_only else 'unpaid + recently paid'}), no AI model used"
+            )
+            return self._bills_reply(bills, unpaid_only=unpaid_only), trace
         trace.append("Not a generic bills question (or it's a targeted one) -> the AI model will answer, with the get_bills tool available")
 
         if self._provider != "ollama" and self._client is None:

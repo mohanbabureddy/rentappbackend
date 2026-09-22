@@ -97,5 +97,49 @@ class GetBillsToolHistoryBoundsTest(unittest.TestCase):
         self.assertIn("never guess or state when records 'start'", GET_BILLS_TOOL["description"])
 
 
+class UnpaidOnlyReplyTest(unittest.TestCase):
+    """"unpaid bills" (or "what do I owe", "pending dues") should show ONLY the
+    unpaid bills -- a plain "my bills" is the one that also shows recently paid
+    ones. Found via a live example: "unpaid bills" was including a "Recently
+    paid" section nobody asked for."""
+
+    def test_unpaid_wording_hides_the_recently_paid_section(self):
+        from types import SimpleNamespace as N
+        from app.assistant import AssistantService
+        bills = [
+            N(month_year="2026-08", bill_type="RENT", paid=False, rent=6000, water=300, electricity=None, miscellaneous=0),
+            N(month_year="2026-07", bill_type="RENT", paid=True, rent=6000, water=300, electricity=None, miscellaneous=0),
+        ]
+        svc = AssistantService(None, None, None)
+        for wording in ("unpaid bills", "what do I owe", "any pending dues?"):
+            reply = svc._bills_reply(bills, unpaid_only=("unpaid" in wording or "owe" in wording or "pending" in wording))
+            self.assertIn("Unpaid bills:", reply, wording)
+            self.assertNotIn("Recently paid", reply, wording)
+
+    def test_generic_my_bills_still_shows_both_sections(self):
+        from types import SimpleNamespace as N
+        from app.assistant import AssistantService
+        bills = [
+            N(month_year="2026-08", bill_type="RENT", paid=False, rent=6000, water=300, electricity=None, miscellaneous=0),
+            N(month_year="2026-07", bill_type="RENT", paid=True, rent=6000, water=300, electricity=None, miscellaneous=0),
+        ]
+        reply = AssistantService(None, None, None)._bills_reply(bills, unpaid_only=False)
+        self.assertIn("Unpaid bills:", reply)
+        self.assertIn("Recently paid:", reply)
+
+    def test_routing_detects_unpaid_intent_from_the_message(self):
+        from app.assistant import BILLS_QUESTION, BILLS_TARGETED_QUESTION, UNPAID_ONLY_QUESTION
+        for msg, expect_unpaid_only in [
+            ("unpaid bills", True),
+            ("what do I owe", True),
+            ("any pending dues?", True),
+            ("my bills", False),
+            ("show my bills", False),
+        ]:
+            self.assertTrue(BILLS_QUESTION.search(msg), msg)
+            self.assertFalse(BILLS_TARGETED_QUESTION.search(msg), msg)
+            self.assertEqual(bool(UNPAID_ONLY_QUESTION.search(msg)), expect_unpaid_only, msg)
+
+
 if __name__ == "__main__":
     unittest.main()
