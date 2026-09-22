@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 import anthropic
 import requests
 
-from app.models import TenantBill, User
+from app.models import TenantBill, User, utc_now
 from app.repositories import DepositRepository, TenantBillRepository, UserRepository
 
 logger = logging.getLogger("app.assistant")
@@ -18,7 +18,28 @@ MODEL = "claude-opus-5"
 
 DEPOSIT_QUESTION = re.compile(r"deposit|advance", re.I)
 REFUND_QUESTION = re.compile(r"refund|withdraw|return|\bback\b", re.I)
-BILLS_QUESTION =re.compile(r"\bbills?\b|\bowe\b|\bdues?\b|outstanding|pending amount|unpaid|how much .*pay", re.I)
+BILLS_QUESTION = re.compile(r"\bbills?\b|\bowe\b|\bdues?\b|outstanding|pending amount|unpaid|how much .*pay", re.I)
+# A question that LOOKS like a simple "what are my bills" (matches BILLS_QUESTION
+# above) but is actually asking something specific -- a particular month, a
+# comparison, a superlative, an all-time question, or about a different tenant --
+# needs the model (and the get_bills tool) to answer properly, not the generic
+# "here are your unpaid/paid bills" summary. Without this, BILLS_QUESTION's broad
+# wording (any mention of "bill" or "owe") swallows almost every realistic bill
+# question before the model -- and the tool -- ever sees it.
+BILLS_TARGETED_QUESTION = re.compile(
+    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b|\b20\d{2}\b|"
+    r"compare|\bvs\.?\b|versus|highest|lowest|maximum|minimum|\bmost\b|\bleast\b|average|"
+    r"\bbefore\b|\bafter\b|\bsince\b|\bbetween\b|\bever\b|\bnever\b|"
+    r"this month|last month|next month|\broom\s*\d+\b",
+    re.I,
+)
+# A deposit question that ALSO asks about rent/electricity/bills is a compound
+# question -- e.g. "my average rent, highest electricity bill, and deposit owed,
+# all three". DEPOSIT_QUESTION alone would grab it and answer only the deposit
+# part, silently dropping the rest. The model can answer all of it in one go: the
+# deposit figures are already in its system prompt, and it has the get_bills tool
+# for the rest -- so route the whole thing there instead of the deposit-only reply.
+MULTI_TOPIC_QUESTION = re.compile(r"\brent\b|\belectricity\b|\bbills?\b", re.I)
 IST_OFFSET = timedelta(hours=5, minutes=30)
 MAX_TOOL_ROUNDS = 3  # hard cap so a confused model can't loop forever (cost/latency safety)
 
@@ -31,7 +52,14 @@ GET_BILLS_TOOL = {
     "description": (
         "Look up this tenant's own bills, going further back than the recent summary "
         "already given to you. Use this for anything about a specific past month, a "
-        "specific bill type, or a total across many months that isn't already answered above."
+        "specific bill type, or a total/average/comparison/highest/lowest across many "
+        "months. Call it with NO arguments to get every bill on record -- always do this "
+        "for 'ever', 'always', 'never', or 'did I ever miss a payment' style questions, and "
+        "for anything about how far back the records go, or a date that might be before any "
+        "bill exists -- since the summary above only covers the last 12 months and does NOT "
+        "tell you when the tenant's history actually starts. Never answer a question about "
+        "history, totals, 'ever', or the earliest/oldest bill from the summary alone, and "
+        "never guess or state when records 'start' without calling this first."
     ),
     "input_schema": {
         "type": "object",
@@ -246,6 +274,11 @@ class AssistantService:
                     f"miscellaneous=Rs.{b.miscellaneous or 0}, total=Rs.{total}, status={status}"
                 )
         bills_block = "\n".join(bill_lines) if bill_lines else "No bills on record."
+        if len(bills) > len(recent):
+            bills_block += (
+                f"\n(These are only the {len(recent)} most recent bills. There are {len(bills)} in total -- "
+                "call get_bills for anything older, or for an all-time/ever/average/total question.)"
+            )
 
         admin_block = (
             f"Property manager / owner contact: name={admin.full_name or admin.username}, "
@@ -263,16 +296,27 @@ class AssistantService:
                 f"remaining Rs.{max(demanded - paid_deposit, 0)}. The tenant can pay deposit "
                 "in instalments using 'Pay Deposit' at the top of the My Bills page."
             )
+        deposit_block += (
+            " Deposit refunds are NOT processed in this app -- the owner settles the deposit "
+            "with the tenant directly when they move out; never say otherwise."
+        )
 
+        today = (utc_now() + IST_OFFSET).strftime("%Y-%m-%d")
         return (
             "You are the support assistant of a rent management app. You are NOT the tenant. "
+            f"Today's date is {today} (Indian time) -- use this to work out what 'this month', "
+            "'last month' etc. mean. "
             f"The person chatting with you is the tenant named '{tenant.full_name or tenant.username}'; address them "
-            "as 'you'. Answer their questions. Use ONLY the data below -- never invent "
+            "as 'you'. Answer only about THIS tenant -- if asked about another tenant/room, say you can "
+            "only help with their own account. Use ONLY the data below and the get_bills tool -- never invent "
             "bank account numbers, UPI IDs, or any payment detail that isn't given here. "
             "Rent and electricity are separate bills, each paid entirely inside this app via the 'Pay' button on the tenant's "
             "Bills page (a Razorpay checkout popup); there is no separate bank transfer or "
-            "UPI payment to make. If asked something this data doesn't cover, say so honestly "
-            "instead of guessing. You cannot take any action (you cannot file complaints, send messages, or contact anyone); only answer questions from the data. Keep answers short and direct.\n\n"
+            "UPI payment to make. If asked something this data doesn't cover even after calling get_bills, say so "
+            "honestly instead of guessing. If get_bills returns an empty list for what was asked, that means there "
+            "is NO bill on record for it -- say so plainly; never substitute a nearby or typical month's amount. "
+            "You cannot take any action (you cannot file complaints, send messages, or "
+            "contact anyone); only answer questions from the data. Keep answers short and direct.\n\n"
             f"{admin_block}\n\n{deposit_block}\n\n"
             f"Tenant's bill history (most recent first):\n{bills_block}"
         )
@@ -293,20 +337,20 @@ class AssistantService:
             raise ValueError("Tenant not found")
         trace.append(f"Identified tenant from login token: {tenant.username}")
 
-        if DEPOSIT_QUESTION.search(message):
+        if DEPOSIT_QUESTION.search(message) and not MULTI_TOPIC_QUESTION.search(message):
             if REFUND_QUESTION.search(message):
                 trace.append("Deposit word + refund/withdraw word found -> fixed refund reply, no AI model used")
                 return self._deposit_refund_reply(), trace
-            trace.append("Deposit word found -> exact reply built from the deposit ledger in the database, no AI model used")
+            trace.append("Deposit word found (and nothing else) -> exact reply built from the deposit ledger in the database, no AI model used")
             return self._deposit_reply(tenant), trace
-        trace.append("No deposit word -> not a deposit question")
+        trace.append("Not a deposit-only question -> not answered by the deposit fixed reply")
 
         bills = self.bill_repo.find_by_tenant_name_order_by_month_desc(username)
         trace.append(f"Loaded {len(bills)} bill(s) for this tenant from the database")
-        if BILLS_QUESTION.search(message):
-            trace.append("Bills word found -> exact reply built from the bills, no AI model used")
+        if BILLS_QUESTION.search(message) and not BILLS_TARGETED_QUESTION.search(message):
+            trace.append("Generic bills word found (and nothing more specific) -> exact reply built from the bills, no AI model used")
             return self._bills_reply(bills), trace
-        trace.append("No bills word -> not a bills question, so the AI model will answer")
+        trace.append("Not a generic bills question (or it's a targeted one) -> the AI model will answer, with the get_bills tool available")
 
         if self._provider != "ollama" and self._client is None:
             raise RuntimeError("The assistant isn't configured yet (missing ANTHROPIC_API_KEY in .env).")
