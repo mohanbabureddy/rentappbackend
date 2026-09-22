@@ -59,6 +59,13 @@ class User(Base):
     # A token whose "ver" no longer matches this column is from an earlier login
     # and is rejected -- this is what limits an account to one signed-in device.
     session_version = Column(Integer, default=0, nullable=False)
+    # A one-time code the admin hands the legitimate incoming tenant, required to
+    # start registration on this username (see app.services.generate_registration_key
+    # and the check in start_registration). Stops anyone who merely knows a room's
+    # username -- most importantly a departed tenant -- from registering on it again.
+    # None on accounts that existed before this feature shipped; start_registration
+    # skips the check in that case rather than locking out a pending registration.
+    registration_code = Column(String(20), nullable=True)
 
 
 class TenantBill(Base):
@@ -128,6 +135,63 @@ class DepositPayment(Base):
     payment_id = Column(String(255), nullable=True)
     notes = Column(String(500), nullable=True)
     paid_date = Column(DateTime, default=utc_now, nullable=False)
+
+
+class VacateRequest(Base):
+    """A tenant's request to move out. `vacate_date` is calculated once, at
+    request time, from app.vacate.calculate_vacate_date -- never recomputed
+    later, so it can't silently shift if the request is looked at on a
+    different day. Only one open (PENDING/APPROVED) request per tenant at a time.
+
+    Status lifecycle: PENDING (tenant requested, awaiting owner approval) ->
+    APPROVED (owner approved the move-out date) -> SETTLED (owner recorded the
+    deposit settlement after inspecting the room). CANCELLED can happen from
+    PENDING or APPROVED."""
+
+    __tablename__ = "vacate_requests"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_username = Column(String(255), nullable=False)
+    requested_date = Column(Date, nullable=False)
+    vacate_date = Column(Date, nullable=False)
+    status = Column(String(20), default="PENDING", nullable=False)  # PENDING | APPROVED | CANCELLED | SETTLED
+    created_date = Column(DateTime, default=utc_now, nullable=False)
+    cancelled_date = Column(DateTime, nullable=True)
+    approved_date = Column(DateTime, nullable=True)
+    # Recorded by the owner once the tenant has physically moved out and the
+    # room has been inspected -- never recomputed, so the figures shown to the
+    # tenant can't silently change later.
+    settlement_deduction = Column(Float, nullable=True)
+    settlement_refund_amount = Column(Float, nullable=True)
+    settlement_refund_method = Column(String(20), nullable=True)  # CASH | BANK_TRANSFER | UPI
+    settlement_note = Column(String(500), nullable=True)
+    settled_date = Column(DateTime, nullable=True)
+    # The tenant's own confirmation that they actually received the refund,
+    # plus optional feedback -- required before the owner can free up the
+    # username (see TenantOffboardService.finalize_move_out), so freeing a
+    # username always means the outgoing tenant was heard from, not just that
+    # the owner says they paid.
+    tenant_acknowledged = Column(BitBoolean, default=False, nullable=False)
+    tenant_feedback = Column(Text, nullable=True)
+    acknowledged_date = Column(DateTime, nullable=True)
+
+
+class ArchivedTenant(Base):
+    """A full snapshot of everything tied to a tenant's username, taken when
+    the owner frees that username up for a new tenant after a settled
+    move-out (see app.services.TenantOffboardService). The live bills,
+    complaints, occupants, deposit payments and vacate requests for that
+    username are deleted right after this is written -- this table is the
+    only place that history still exists, so a new registration starts on a
+    genuinely clean slate."""
+
+    __tablename__ = "archived_tenants"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String(255), nullable=False)
+    archived_date = Column(DateTime, default=utc_now, nullable=False)
+    archived_by = Column(String(255), nullable=True)
+    data = Column(Text, nullable=False)  # JSON snapshot: bills, complaints, occupants, deposits, vacate requests
 
 
 class TransactionLog(Base):

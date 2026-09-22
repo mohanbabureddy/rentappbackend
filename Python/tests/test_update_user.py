@@ -19,7 +19,7 @@ def _put(body, user, role="ADMIN"):
 
 
 def _user():
-    return N(id=5, username="Room1", role="TENANT", password="x", mail="a@b.c", phone="9876543210", full_name="Ravindra", registration_completed=True)
+    return N(id=5, username="Room1", role="TENANT", password="x", mail="a@b.c", phone="9876543210", full_name="Ravindra", registration_completed=True, registration_code=None)
 
 
 class UpdateUserClearTest(unittest.TestCase):
@@ -53,6 +53,15 @@ class UpdateUserClearTest(unittest.TestCase):
         self.assertFalse(user.registration_completed)
         self.assertEqual(_put({"registrationCompleted": True}, user).status_code, 200)
         self.assertTrue(user.registration_completed)
+
+    def test_resetting_to_unregistered_issues_a_fresh_registration_key(self):
+        # So a departed tenant who remembers their old key can't re-register
+        # on the same username once it's freed up for someone new.
+        user = _user()
+        self.assertIsNone(user.registration_code)
+        r = _put({"registrationCompleted": False}, user)
+        self.assertIsNotNone(user.registration_code)
+        self.assertEqual(r.get_json()["registrationKey"], user.registration_code)
 
     def test_status_left_alone_when_not_sent(self):
         user = _user()

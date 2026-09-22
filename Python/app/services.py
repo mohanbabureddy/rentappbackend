@@ -1,9 +1,11 @@
+import json
 import logging
 import os
 import random
 import re
+import secrets
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -11,8 +13,19 @@ import bcrypt
 import requests
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from app.models import Complaint, DepositPayment, Occupant, TenantBill, TransactionLog, User, utc_now
-from app.repositories import ComplaintRepository, DepositRepository, OccupantRepository, TenantBillRepository, TransactionLogRepository, UserRepository
+from app.models import ArchivedTenant, Complaint, DepositPayment, Occupant, TenantBill, TransactionLog, User, VacateRequest, utc_now
+from app.repositories import ArchivedTenantRepository, ComplaintRepository, DepositRepository, OccupantRepository, TenantBillRepository, TransactionLogRepository, UserRepository, VacateRequestRepository
+from app.vacate import calculate_vacate_date
+
+# Excludes 0/O/1/I so a code read aloud over the phone can't be confused --
+# these are handed from owner to incoming tenant outside the app (in person,
+# a call, a text), so they have to survive being spoken, not just typed.
+_REGISTRATION_KEY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def generate_registration_key() -> str:
+    chars = [secrets.choice(_REGISTRATION_KEY_ALPHABET) for _ in range(8)]
+    return "".join(chars[:4]) + "-" + "".join(chars[4:])
 
 UPLOADS_ROOT = Path(__file__).resolve().parents[1] / "uploads"
 
@@ -408,6 +421,296 @@ class ComplaintService:
         saved = self.repo.save(complaint)
         self.logger.info("Tenant %s withdrew complaint %s.", saved.tenant_name, complaint_id)
         return saved
+
+
+class VacateService:
+    """A tenant's move-out request. The vacate date is calculated once, at
+    request time, from IST 'today' (not the server's own clock -- see the
+    utc_now()+IST_OFFSET pattern used elsewhere for why that matters), and
+    is never recalculated later.
+
+    Lifecycle: PENDING (tenant requested) -> APPROVED (owner approved) ->
+    SETTLED (owner recorded the deposit settlement after move-out). CANCELLED
+    can happen from PENDING or APPROVED. Rent keeps being billed as normal for
+    every month up to and including the move-out month -- this service never
+    touches TenantBillService, deliberately, so there's no proration logic to
+    get wrong."""
+
+    IST_OFFSET = timedelta(hours=5, minutes=30)
+    REFUND_METHODS = ("CASH", "BANK_TRANSFER", "UPI")
+
+    def __init__(self, repo: VacateRequestRepository, deposit_repo: Optional[DepositRepository] = None):
+        self.repo = repo
+        self.deposit_repo = deposit_repo
+        self.logger = logging.getLogger("app.services")
+
+    def _dto(self, r: VacateRequest) -> Dict[str, Any]:
+        return {
+            "id": r.id,
+            "tenantUsername": r.tenant_username,
+            "requestedDate": r.requested_date.isoformat(),
+            "vacateDate": r.vacate_date.isoformat(),
+            "status": r.status,
+            "approvedDate": to_iso_utc(r.approved_date),
+            # Only populated when a DepositRepository was given (the admin
+            # listing) -- shown so the owner can see how much deposit is on
+            # file for this tenant right where they decide a deduction,
+            # instead of having to look it up on a different page.
+            "depositTotal": self.deposit_repo.total_for_tenant(r.tenant_username) if self.deposit_repo else None,
+            "settlement": {
+                "deduction": r.settlement_deduction,
+                "refundAmount": r.settlement_refund_amount,
+                "refundMethod": r.settlement_refund_method,
+                "note": r.settlement_note,
+                "settledDate": to_iso_utc(r.settled_date),
+                "tenantAcknowledged": bool(r.tenant_acknowledged),
+                "tenantFeedback": r.tenant_feedback,
+                "acknowledgedDate": to_iso_utc(r.acknowledged_date),
+            } if r.status == "SETTLED" else None,
+        }
+
+    def preview_vacate_date(self) -> str:
+        """What the date WOULD be if requested right now -- shown before the
+        tenant confirms, computed fresh each time (not stored)."""
+        today = (utc_now() + self.IST_OFFSET).date()
+        return calculate_vacate_date(today).isoformat()
+
+    def get_status(self, tenant_username: str) -> Optional[Dict[str, Any]]:
+        """The tenant's current request -- open (PENDING/APPROVED) if there is
+        one, otherwise their most recent SETTLED request so they can still see
+        the final refund breakdown. A CANCELLED request is hidden once
+        cancelled, so the tenant can freely request again."""
+        latest = self.repo.find_latest_by_tenant(tenant_username)
+        if latest is None or latest.status == "CANCELLED":
+            return None
+        return self._dto(latest)
+
+    def request_vacate(self, tenant_username: str) -> Dict[str, Any]:
+        if self.repo.find_open_by_tenant(tenant_username) is not None:
+            raise ValueError("You already have an active vacate request.")
+        today = (utc_now() + self.IST_OFFSET).date()
+        request = VacateRequest(
+            tenant_username=tenant_username,
+            requested_date=today,
+            vacate_date=calculate_vacate_date(today),
+            status="PENDING",
+        )
+        saved = self.repo.save(request)
+        self.logger.info("Tenant %s requested to vacate; calculated date %s (pending owner approval).", tenant_username, saved.vacate_date)
+        return self._dto(saved)
+
+    def cancel_vacate(self, tenant_username: str) -> None:
+        active = self.repo.find_open_by_tenant(tenant_username)
+        if active is None:
+            raise ValueError("You don't have an active vacate request.")
+        if active.status != "PENDING":
+            # Once the owner has approved it, they're already planning around
+            # the move-out date -- the tenant can no longer back out unilaterally.
+            raise PermissionError("This request has already been approved by the owner and can no longer be cancelled.")
+        active.status = "CANCELLED"
+        active.cancelled_date = utc_now()
+        self.repo.save(active)
+        self.logger.info("Tenant %s cancelled their vacate request (id=%s).", tenant_username, active.id)
+
+    def acknowledge_settlement(self, tenant_username: str, feedback: Optional[str]) -> Dict[str, Any]:
+        """The tenant confirms they actually received the refund, with
+        optional feedback for the owner. Required before the owner can free
+        up the username -- see TenantOffboardService.finalize_move_out."""
+        latest = self.repo.find_latest_by_tenant(tenant_username)
+        if latest is None or latest.status != "SETTLED":
+            raise ValueError("There's no settled move-out for you to acknowledge.")
+        if latest.tenant_acknowledged:
+            raise ValueError("You've already acknowledged this settlement.")
+        latest.tenant_acknowledged = True
+        latest.tenant_feedback = (feedback or "").strip() or None
+        latest.acknowledged_date = utc_now()
+        saved = self.repo.save(latest)
+        self.logger.info("Tenant %s acknowledged their settlement (request id=%s).", tenant_username, saved.id)
+        return self._dto(saved)
+
+    def list_all_open(self) -> List[Dict[str, Any]]:
+        return [self._dto(r) for r in self.repo.find_all_open()]
+
+    def list_all_settled(self) -> List[Dict[str, Any]]:
+        """Settled requests still waiting on the owner to free up the
+        username (see TenantOffboardService.finalize_move_out)."""
+        return [self._dto(r) for r in self.repo.find_all_settled()]
+
+    def approve_vacate(self, request_id: int) -> Dict[str, Any]:
+        req = self.repo.find_by_id(request_id)
+        if req is None or req.status != "PENDING":
+            raise ValueError("No pending vacate request with that id.")
+        req.status = "APPROVED"
+        req.approved_date = utc_now()
+        saved = self.repo.save(req)
+        self.logger.info("Approved vacate request %s for tenant %s (move-out %s).", saved.id, saved.tenant_username, saved.vacate_date)
+        return self._dto(saved)
+
+    def settle_vacate(self, request_id: int, deduction: float, refund_method: str, note: Optional[str]) -> Dict[str, Any]:
+        """Owner records the post-inspection settlement: damage deducted from
+        the deposit, how the remainder was refunded, and an optional note.
+        The refund amount is computed once here from the tenant's deposit
+        ledger total and stored -- never recomputed -- so it can't drift if
+        more deposit rows are added afterwards."""
+        req = self.repo.find_by_id(request_id)
+        if req is None or req.status != "APPROVED":
+            raise ValueError("No approved vacate request with that id.")
+        if deduction < 0:
+            raise ValueError("Deduction cannot be negative")
+        if refund_method not in self.REFUND_METHODS:
+            raise ValueError("refundMethod must be one of: " + ", ".join(self.REFUND_METHODS))
+        if self.deposit_repo is None:
+            raise ValueError("Deposit records are unavailable")
+        deposited = self.deposit_repo.total_for_tenant(req.tenant_username)
+        if deduction > deposited:
+            raise ValueError(f"Deduction cannot exceed the deposited amount (Rs. {deposited:.2f}).")
+
+        req.status = "SETTLED"
+        req.settlement_deduction = deduction
+        req.settlement_refund_amount = deposited - deduction
+        req.settlement_refund_method = refund_method
+        req.settlement_note = (note or "").strip() or None
+        req.settled_date = utc_now()
+        saved = self.repo.save(req)
+        self.logger.info(
+            "Settled vacate request %s for tenant %s: deposited=%s deduction=%s refund=%s method=%s.",
+            saved.id, saved.tenant_username, deposited, deduction, saved.settlement_refund_amount, refund_method,
+        )
+        return self._dto(saved)
+
+
+def _archive_bill(b: TenantBill) -> Dict[str, Any]:
+    return {
+        "monthYear": b.month_year, "billType": b.bill_type, "rent": b.rent, "water": b.water,
+        "electricity": b.electricity, "miscellaneous": b.miscellaneous, "paid": bool(b.paid),
+        "paidDate": to_iso_utc(b.paid_date), "createdDate": b.created_date.isoformat() if b.created_date else None,
+    }
+
+
+def _archive_complaint(c: Complaint) -> Dict[str, Any]:
+    return {
+        "description": c.description, "status": c.status, "createdDate": to_iso_utc(c.created_date),
+        "resolutionComment": c.resolution_comment, "closedDate": to_iso_utc(c.closed_date),
+    }
+
+
+def _archive_occupant(o: Occupant) -> Dict[str, Any]:
+    return {
+        "name": o.name, "aadharFileName": o.aadhar_file_name, "aadharStoragePath": o.aadhar_storage_path,
+        "uploadedAt": to_iso_utc(o.uploaded_at), "verified": bool(o.verified), "verifiedBy": o.verified_by,
+        "verifiedAt": to_iso_utc(o.verified_at),
+    }
+
+
+def _archive_deposit(d: DepositPayment) -> Dict[str, Any]:
+    return {"amount": d.amount, "source": d.source, "paymentId": d.payment_id, "notes": d.notes, "paidDate": to_iso_utc(d.paid_date)}
+
+
+def _archive_vacate_request(v: VacateRequest) -> Dict[str, Any]:
+    return {
+        "requestedDate": v.requested_date.isoformat(), "vacateDate": v.vacate_date.isoformat(), "status": v.status,
+        "approvedDate": to_iso_utc(v.approved_date), "cancelledDate": to_iso_utc(v.cancelled_date),
+        "settlementDeduction": v.settlement_deduction, "settlementRefundAmount": v.settlement_refund_amount,
+        "settlementRefundMethod": v.settlement_refund_method, "settlementNote": v.settlement_note,
+        "settledDate": to_iso_utc(v.settled_date),
+        "tenantAcknowledged": bool(v.tenant_acknowledged), "tenantFeedback": v.tenant_feedback,
+        "acknowledgedDate": to_iso_utc(v.acknowledged_date),
+    }
+
+
+class TenantOffboardService:
+    """Frees a room's username up for a new tenant once their move-out has
+    been settled: the outgoing tenant's whole history is snapshotted into
+    ArchivedTenantRepository, the live tables are cleared for that username,
+    and the User account is reset to accept a fresh registration -- protected
+    by a brand-new registration key so the outgoing tenant (or anyone else who
+    merely knows the username) can't register on it again."""
+
+    def __init__(
+        self,
+        vacate_repo: VacateRequestRepository,
+        bill_repo: TenantBillRepository,
+        complaint_repo: ComplaintRepository,
+        occupant_repo: OccupantRepository,
+        deposit_repo: DepositRepository,
+        archive_repo: ArchivedTenantRepository,
+        user_repo: UserRepository,
+    ):
+        self.vacate_repo = vacate_repo
+        self.bill_repo = bill_repo
+        self.complaint_repo = complaint_repo
+        self.occupant_repo = occupant_repo
+        self.deposit_repo = deposit_repo
+        self.archive_repo = archive_repo
+        self.user_repo = user_repo
+        self.logger = logging.getLogger("app.services")
+
+    def finalize_move_out(self, request_id: int, admin_username: str) -> Dict[str, Any]:
+        req = self.vacate_repo.find_by_id(request_id)
+        if req is None or req.status != "SETTLED":
+            raise ValueError("No settled vacate request with that id.")
+        if not req.tenant_acknowledged:
+            raise PermissionError("The tenant hasn't confirmed receiving their refund yet.")
+        username = req.tenant_username
+
+        # A username can't be handed to a new tenant while loose ends remain
+        # on record for the old one -- an unresolved complaint or an
+        # unverified occupant photo needs the owner's attention first, not to
+        # quietly vanish into the archive.
+        complaints = self.complaint_repo.find_by_tenant_name_order_by_created_desc(username)
+        open_complaints = [c for c in complaints if c.status != "CLOSED"]
+        if open_complaints:
+            raise PermissionError(f"{len(open_complaints)} complaint(s) are still open. Close them before freeing up this username.")
+
+        occupants = self.occupant_repo.find_by_tenant_username_order_by_uploaded_desc(username)
+        unverified_occupants = [o for o in occupants if not o.verified]
+        if unverified_occupants:
+            raise PermissionError(f"{len(unverified_occupants)} occupant photo(s) are not yet verified. Verify them before freeing up this username.")
+
+        user = self.user_repo.find_by_username(username)
+        if user is None:
+            raise ValueError("Tenant account not found.")
+
+        snapshot = {
+            "fullName": user.full_name,
+            "mail": user.mail,
+            "phone": user.phone,
+            "moveInDate": user.move_in_date.isoformat() if user.move_in_date else None,
+            "demandedDeposit": user.demanded_deposit,
+            "bills": [_archive_bill(b) for b in self.bill_repo.find_by_tenant_name_order_by_month_desc(username)],
+            "complaints": [_archive_complaint(c) for c in complaints],
+            "occupants": [_archive_occupant(o) for o in occupants],
+            "depositPayments": [_archive_deposit(d) for d in self.deposit_repo.find_by_tenant_order_by_date_desc(username)],
+            "vacateRequests": [_archive_vacate_request(v) for v in self.vacate_repo.find_all_by_tenant(username)],
+        }
+        self.archive_repo.save(ArchivedTenant(username=username, archived_by=admin_username, data=json.dumps(snapshot)))
+
+        self.bill_repo.delete_all_for_tenant(username)
+        self.complaint_repo.delete_all_for_tenant(username)
+        self.occupant_repo.delete_all_for_tenant(username)
+        self.deposit_repo.delete_all_for_tenant(username)
+        self.vacate_repo.delete_all_for_tenant(username)
+
+        new_key = generate_registration_key()
+        user.registration_completed = False
+        user.mail = None
+        user.phone = None
+        user.full_name = None
+        user.move_in_date = None
+        user.demanded_deposit = None
+        # Fresh unguessable password -- the outgoing tenant's old password
+        # must not still work once the username is handed to someone new.
+        user.password = generate_password_hash(secrets.token_urlsafe(32))
+        # Invalidates any token from the outgoing tenant's last login.
+        user.session_version = (user.session_version or 0) + 1
+        user.registration_code = new_key
+        self.user_repo.save(user)
+
+        self.logger.info(
+            "Offboarded tenant '%s' (archived vacate request %s); username freed for a new registration.",
+            username, request_id,
+        )
+        return {"username": username, "registrationKey": new_key}
 
 
 class OccupantService:

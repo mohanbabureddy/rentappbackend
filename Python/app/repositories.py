@@ -3,7 +3,7 @@ from typing import List, Optional
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.models import Complaint, DepositPayment, Occupant, TenantBill, TransactionLog, User
+from app.models import ArchivedTenant, Complaint, DepositPayment, Occupant, TenantBill, TransactionLog, User, VacateRequest
 
 
 class UserRepository:
@@ -73,6 +73,10 @@ class TenantBillRepository:
             self.db.delete(bill)
             self.db.commit()
 
+    def delete_all_for_tenant(self, tenant_name: str) -> None:
+        self.db.query(TenantBill).filter(TenantBill.tenant_name == tenant_name).delete()
+        self.db.commit()
+
 
 class ComplaintRepository:
     def __init__(self, db: Session):
@@ -92,6 +96,10 @@ class ComplaintRepository:
 
     def find_by_id(self, complaint_id: int) -> Optional[Complaint]:
         return self.db.query(Complaint).filter(Complaint.id == complaint_id).first()
+
+    def delete_all_for_tenant(self, tenant_name: str) -> None:
+        self.db.query(Complaint).filter(Complaint.tenant_name == tenant_name).delete()
+        self.db.commit()
 
 
 class TransactionLogRepository:
@@ -128,6 +136,10 @@ class OccupantRepository:
         self.db.delete(occupant)
         self.db.commit()
 
+    def delete_all_for_tenant(self, tenant_username: str) -> None:
+        self.db.query(Occupant).filter(Occupant.tenant_username == tenant_username).delete()
+        self.db.commit()
+
 
 class DepositRepository:
     def __init__(self, db: Session):
@@ -151,3 +163,88 @@ class DepositRepository:
         self.db.commit()
         self.db.refresh(payment)
         return payment
+
+    def delete_all_for_tenant(self, tenant_username: str) -> None:
+        self.db.query(DepositPayment).filter(DepositPayment.tenant_username == tenant_username).delete()
+        self.db.commit()
+
+
+class VacateRequestRepository:
+    OPEN_STATUSES = ("PENDING", "APPROVED")
+
+    def __init__(self, db: Session):
+        self.db = db
+
+    def find_open_by_tenant(self, tenant_username: str) -> Optional[VacateRequest]:
+        """The tenant's in-progress request (PENDING or APPROVED) -- there can
+        only ever be one at a time; a CANCELLED or SETTLED one doesn't block
+        a fresh request."""
+        return (
+            self.db.query(VacateRequest)
+            .filter(VacateRequest.tenant_username == tenant_username, VacateRequest.status.in_(self.OPEN_STATUSES))
+            .order_by(VacateRequest.id.desc())
+            .first()
+        )
+
+    def find_latest_by_tenant(self, tenant_username: str) -> Optional[VacateRequest]:
+        """The most recent request regardless of status, so a tenant can still
+        see the outcome (approved / settled) after it's no longer 'open'."""
+        return (
+            self.db.query(VacateRequest)
+            .filter(VacateRequest.tenant_username == tenant_username)
+            .order_by(VacateRequest.id.desc())
+            .first()
+        )
+
+    def find_all_open(self) -> List[VacateRequest]:
+        return (
+            self.db.query(VacateRequest)
+            .filter(VacateRequest.status.in_(self.OPEN_STATUSES))
+            .order_by(VacateRequest.vacate_date.asc())
+            .all()
+        )
+
+    def find_all_settled(self) -> List[VacateRequest]:
+        """Settled but not yet finalized (finalizing deletes the row) -- these
+        are the ones still waiting on the owner to free up the username."""
+        return (
+            self.db.query(VacateRequest)
+            .filter(VacateRequest.status == "SETTLED")
+            .order_by(VacateRequest.settled_date.asc())
+            .all()
+        )
+
+    def find_all_by_tenant(self, tenant_username: str) -> List[VacateRequest]:
+        return (
+            self.db.query(VacateRequest)
+            .filter(VacateRequest.tenant_username == tenant_username)
+            .order_by(VacateRequest.id.asc())
+            .all()
+        )
+
+    def find_by_id(self, request_id: int) -> Optional[VacateRequest]:
+        return self.db.query(VacateRequest).filter(VacateRequest.id == request_id).first()
+
+    def save(self, request: VacateRequest) -> VacateRequest:
+        self.db.add(request)
+        self.db.commit()
+        self.db.refresh(request)
+        return request
+
+    def delete_all_for_tenant(self, tenant_username: str) -> None:
+        self.db.query(VacateRequest).filter(VacateRequest.tenant_username == tenant_username).delete()
+        self.db.commit()
+
+
+class ArchivedTenantRepository:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def save(self, record: ArchivedTenant) -> ArchivedTenant:
+        self.db.add(record)
+        self.db.commit()
+        self.db.refresh(record)
+        return record
+
+    def find_all(self) -> List[ArchivedTenant]:
+        return self.db.query(ArchivedTenant).order_by(ArchivedTenant.archived_date.desc()).all()

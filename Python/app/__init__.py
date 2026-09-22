@@ -108,16 +108,61 @@ _LATER_COLUMNS = [
     ("users", "demanded_deposit", "DOUBLE PRECISION"),
     ("tenant_bills", "bill_type", "VARCHAR(20) NOT NULL DEFAULT 'RENT'"),
     ("users", "session_version", "INTEGER NOT NULL DEFAULT 0"),
+    ("vacate_requests", "approved_date", "DATETIME"),
+    ("vacate_requests", "settlement_deduction", "DOUBLE PRECISION"),
+    ("vacate_requests", "settlement_refund_amount", "DOUBLE PRECISION"),
+    ("vacate_requests", "settlement_refund_method", "VARCHAR(20)"),
+    ("vacate_requests", "settlement_note", "VARCHAR(500)"),
+    ("vacate_requests", "settled_date", "DATETIME"),
+    ("users", "registration_code", "VARCHAR(20)"),
+    ("vacate_requests", "tenant_acknowledged", "INTEGER NOT NULL DEFAULT 0"),
+    ("vacate_requests", "tenant_feedback", "TEXT"),
+    ("vacate_requests", "acknowledged_date", "DATETIME"),
 ]
 
 
 def _ensure_later_columns():
     from sqlalchemy import inspect, text
+    inspector = inspect(engine)
+    if "vacate_requests" in inspector.get_table_names():
+        existing_columns = {c["name"] for c in inspector.get_columns("vacate_requests")}
+        if "approved_date" not in existing_columns:
+            # Pre-dates the owner-approval workflow: requests made under the old
+            # ACTIVE/CANCELLED-only model were already confirmed, so they map to
+            # today's APPROVED rather than the new PENDING (which would otherwise
+            # wrongly ask the owner to approve something already in motion).
+            with engine.begin() as conn:
+                conn.execute(text("UPDATE vacate_requests SET status = 'APPROVED' WHERE status = 'ACTIVE'"))
+
+    users_columns = {c["name"] for c in inspector.get_columns("users")} if "users" in inspector.get_table_names() else set()
+    # Registration keys are new -- every tenant account created before this
+    # column existed has none yet, and without one they'd have nothing to
+    # hand a new registrant and nothing for the owner to export.
+    need_key_backfill = "registration_code" not in users_columns
+
     for table, column, ddl in _LATER_COLUMNS:
         if column not in {c["name"] for c in inspect(engine).get_columns(table)}:
             with engine.begin() as conn:
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
             app.logger.info("Added %s.%s column.", table, column)
+
+    if need_key_backfill:
+        from app.database import SessionLocal
+        from app.models import User
+        from app.services import generate_registration_key
+
+        session = SessionLocal()
+        try:
+            pending = session.query(User).filter(
+                User.role == "TENANT", User.registration_completed == False, User.registration_code.is_(None)  # noqa: E712 (BitBoolean; == compiles to "= 0", .is_() would emit "IS 0" which MySQL rejects)
+            ).all()
+            for u in pending:
+                u.registration_code = generate_registration_key()
+            if pending:
+                session.commit()
+                app.logger.info("Generated registration keys for %d pre-existing pending tenant(s).", len(pending))
+        finally:
+            session.close()
 
 
 _ensure_later_columns()

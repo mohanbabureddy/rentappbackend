@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 import secrets
@@ -18,8 +19,8 @@ from app.database import get_db
 from app.debug_trace import trace_request
 from app.models import Complaint, Occupant, TenantBill, User
 from app.payments import PaymentService
-from app.repositories import ComplaintRepository, DepositRepository, OccupantRepository, TenantBillRepository, TransactionLogRepository, UserRepository
-from app.services import ComplaintService, DepositService, EmailService, LoginLockedError, LoginThrottle, OccupantService, OTPCooldownError, OTPService, TenantBillService, TransactionService, UserService, fetch_uploaded_file, to_iso_utc, verify_password
+from app.repositories import ArchivedTenantRepository, ComplaintRepository, DepositRepository, OccupantRepository, TenantBillRepository, TransactionLogRepository, UserRepository, VacateRequestRepository
+from app.services import ComplaintService, DepositService, EmailService, LoginLockedError, LoginThrottle, OccupantService, OTPCooldownError, OTPService, TenantBillService, TenantOffboardService, TransactionService, UserService, VacateService, fetch_uploaded_file, generate_registration_key, to_iso_utc, verify_password
 
 logger = logging.getLogger("app.auth")
 
@@ -117,7 +118,11 @@ def register_routes(app: Flask) -> None:
         # account holds a random one nobody knows, and login is blocked anyway
         # because registration_completed is False.
         password = data.get("password") or secrets.token_urlsafe(32)
-        user = User(username=username, password=generate_password_hash(password), role=role, registration_completed=False)
+        # Tenant accounts need a registration key to start registration (see
+        # start_registration) -- admins skip straight to registered, so they
+        # never need one.
+        registration_code = generate_registration_key() if role == "TENANT" else None
+        user = User(username=username, password=generate_password_hash(password), role=role, registration_completed=False, registration_code=registration_code)
         saved = repo.save(user)
         logger.info("Admin created new user account '%s' (role=%s).", saved.username, saved.role)
         return jsonify({
@@ -127,6 +132,7 @@ def register_routes(app: Flask) -> None:
             "mail": saved.mail,
             "role": saved.role,
             "registrationCompleted": saved.registration_completed,
+            "registrationKey": saved.registration_code,
         }), 201
 
     @app.route("/api/users/signup", methods=["POST"])
@@ -166,6 +172,13 @@ def register_routes(app: Flask) -> None:
         if user.registration_completed:
             logger.warning("Registration start rejected for '%s': already completed.", username)
             return jsonify({"error": "Registration already completed"}), 409
+        # None means this account predates the registration-key feature -- allow it
+        # through rather than locking out a registration that was already pending.
+        if user.registration_code is not None:
+            provided = str(data.get("registrationKey") or "").strip().upper()
+            if provided != user.registration_code:
+                logger.warning("Registration start rejected for '%s': wrong or missing registration key.", username)
+                return jsonify({"error": "Invalid registration key. Please check with the property owner."}), 403
 
         user.mail = email.strip()
         user.phone = phone
@@ -316,6 +329,9 @@ def register_routes(app: Flask) -> None:
                 "moveInDate": u.move_in_date.isoformat() if u.move_in_date else None,
                 "demandedDeposit": u.demanded_deposit,
                 "totalAmountDeposited": deposit_totals.get(u.username, 0.0),
+                # Only meaningful before registration -- once registered the code is a
+                # stale leftover, so don't hand it out for an account it can't be used on.
+                "registrationKey": u.registration_code if not u.registration_completed else None,
             }
             for u in users
         ]), 200
@@ -349,6 +365,12 @@ def register_routes(app: Flask) -> None:
             registered = data["registrationCompleted"] is True
             if not registered and user.role == "ADMIN":
                 return jsonify({"error": "An admin account cannot be set to not registered (you would be locked out)."}), 400
+            # Resetting a previously-registered tenant back to "not registered"
+            # (e.g. reusing a room's username for a new tenant) needs a fresh
+            # registration key -- otherwise the OLD tenant, who may still
+            # remember their own key, could register again on this username.
+            if not registered and user.registration_completed and user.role == "TENANT":
+                user.registration_code = generate_registration_key()
             user.registration_completed = registered
         # Present-but-empty means "clear it"; absent means "leave it alone".
         if "fullName" in data:
@@ -371,6 +393,7 @@ def register_routes(app: Flask) -> None:
             "mail": user.mail,
             "role": user.role,
             "registrationCompleted": user.registration_completed,
+            "registrationKey": user.registration_code,
         }), 200
 
     @app.route("/api/users/<int:user_id>/movein-deposit", methods=["PUT"])
@@ -744,6 +767,137 @@ def register_routes(app: Flask) -> None:
             }}), 200
         except ValueError:
             return jsonify({"error": "Complaint not found"}), 404
+
+    @app.route("/api/tenants/vacate/preview", methods=["GET"])
+    @require_auth
+    def preview_vacate():
+        service = VacateService(VacateRequestRepository(get_db()))
+        return jsonify({"vacateDate": service.preview_vacate_date()}), 200
+
+    @app.route("/api/tenants/vacate/status", methods=["GET"])
+    @require_auth
+    def vacate_status():
+        service = VacateService(VacateRequestRepository(get_db()))
+        return jsonify(service.get_status(g.current_user["username"])), 200
+
+    @app.route("/api/tenants/vacate/request", methods=["POST"])
+    @require_auth
+    def request_vacate():
+        service = VacateService(VacateRequestRepository(get_db()))
+        try:
+            return jsonify(service.request_vacate(g.current_user["username"])), 201
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 409
+
+    @app.route("/api/tenants/vacate/cancel", methods=["PUT"])
+    @require_auth
+    def cancel_vacate():
+        service = VacateService(VacateRequestRepository(get_db()))
+        try:
+            service.cancel_vacate(g.current_user["username"])
+            return jsonify({"message": "Vacate request cancelled"}), 200
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except PermissionError as exc:
+            return jsonify({"error": str(exc)}), 409
+
+    @app.route("/api/tenants/vacate/acknowledge", methods=["PUT"])
+    @require_auth
+    def acknowledge_vacate_settlement():
+        data = request.get_json(silent=True) or {}
+        service = VacateService(VacateRequestRepository(get_db()))
+        try:
+            return jsonify(service.acknowledge_settlement(g.current_user["username"], data.get("feedback"))), 200
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 409
+
+    @app.route("/api/admin/vacate/all", methods=["GET"])
+    @require_role("ADMIN")
+    def all_vacate_requests():
+        db = get_db()
+        service = VacateService(VacateRequestRepository(db), DepositRepository(db))
+        return jsonify(service.list_all_open()), 200
+
+    @app.route("/api/admin/vacate/<int:request_id>/approve", methods=["PUT"])
+    @require_role("ADMIN")
+    def approve_vacate_request(request_id: int):
+        db = get_db()
+        service = VacateService(VacateRequestRepository(db), DepositRepository(db))
+        try:
+            return jsonify(service.approve_vacate(request_id)), 200
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 404
+
+    @app.route("/api/admin/vacate/<int:request_id>/settle", methods=["PUT"])
+    @require_role("ADMIN")
+    def settle_vacate_request(request_id: int):
+        data = request.get_json(silent=True) or {}
+        db = get_db()
+        service = VacateService(VacateRequestRepository(db), DepositRepository(db))
+        try:
+            deduction = float(data.get("deduction") or 0)
+        except (TypeError, ValueError):
+            return jsonify({"error": "deduction must be a number"}), 400
+        try:
+            return jsonify(service.settle_vacate(
+                request_id, deduction, (data.get("refundMethod") or "").upper(), data.get("note"),
+            )), 200
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    @app.route("/api/admin/vacate/settled", methods=["GET"])
+    @require_role("ADMIN")
+    def settled_vacate_requests():
+        db = get_db()
+        service = VacateService(VacateRequestRepository(db))
+        complaint_repo = ComplaintRepository(db)
+        occupant_repo = OccupantRepository(db)
+        results = service.list_all_settled()
+        # So the admin page can show why "Free up this username" is blocked
+        # before they even click it, instead of only finding out from the
+        # error after -- see TenantOffboardService.finalize_move_out for the
+        # actual enforcement.
+        for r in results:
+            complaints = complaint_repo.find_by_tenant_name_order_by_created_desc(r["tenantUsername"])
+            r["openComplaints"] = sum(1 for c in complaints if c.status != "CLOSED")
+            occupants = occupant_repo.find_by_tenant_username_order_by_uploaded_desc(r["tenantUsername"])
+            r["unverifiedOccupants"] = sum(1 for o in occupants if not o.verified)
+        return jsonify(results), 200
+
+    @app.route("/api/admin/vacate/<int:request_id>/finalize", methods=["PUT"])
+    @require_role("ADMIN")
+    def finalize_vacate_request(request_id: int):
+        db = get_db()
+        service = TenantOffboardService(
+            VacateRequestRepository(db),
+            TenantBillRepository(db),
+            ComplaintRepository(db),
+            OccupantRepository(db),
+            DepositRepository(db),
+            ArchivedTenantRepository(db),
+            UserRepository(db),
+        )
+        try:
+            return jsonify(service.finalize_move_out(request_id, g.current_user["username"])), 200
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except PermissionError as exc:
+            return jsonify({"error": str(exc)}), 409
+
+    @app.route("/api/admin/archived-tenants", methods=["GET"])
+    @require_role("ADMIN")
+    def list_archived_tenants():
+        repo = ArchivedTenantRepository(get_db())
+        return jsonify([
+            {
+                "id": r.id,
+                "username": r.username,
+                "archivedDate": to_iso_utc(r.archived_date),
+                "archivedBy": r.archived_by,
+                "data": json.loads(r.data),
+            }
+            for r in repo.find_all()
+        ]), 200
 
     @app.route("/api/tenants/occupants/<tenant>", methods=["GET"])
     @require_self_or_admin(lambda tenant: tenant)
