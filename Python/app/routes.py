@@ -852,6 +852,7 @@ def register_routes(app: Flask) -> None:
         service = VacateService(VacateRequestRepository(db))
         complaint_repo = ComplaintRepository(db)
         occupant_repo = OccupantRepository(db)
+        bill_repo = TenantBillRepository(db)
         results = service.list_all_settled()
         # So the admin page can show why "Free up this username" is blocked
         # before they even click it, instead of only finding out from the
@@ -862,6 +863,8 @@ def register_routes(app: Flask) -> None:
             r["openComplaints"] = sum(1 for c in complaints if c.status != "CLOSED")
             occupants = occupant_repo.find_by_tenant_username_order_by_uploaded_desc(r["tenantUsername"])
             r["unverifiedOccupants"] = sum(1 for o in occupants if not o.verified)
+            bills = bill_repo.find_by_tenant_name_order_by_month_desc(r["tenantUsername"])
+            r["unpaidBills"] = sum(1 for b in bills if not b.paid)
         return jsonify(results), 200
 
     @app.route("/api/admin/vacate/<int:request_id>/finalize", methods=["PUT"])

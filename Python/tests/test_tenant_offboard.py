@@ -32,6 +32,7 @@ class _FakeListRepo:
     def __init__(self, find_method_name, items):
         setattr(self, find_method_name, lambda username: [i for i in items if self._owner(i) == username])
         self.deleted_for = []
+        self.saved = []
         self._items = items
 
     @staticmethod
@@ -40,6 +41,10 @@ class _FakeListRepo:
 
     def delete_all_for_tenant(self, username):
         self.deleted_for.append(username)
+
+    def save(self, item):
+        self.saved.append(item)
+        return item
 
 
 class _FakeArchiveRepo:
@@ -76,9 +81,9 @@ def _settled_request(acknowledged=True):
     )
 
 
-def _bill():
+def _bill(paid=True):
     return N(tenant_name="Room1", month_year="2026-09", bill_type="RENT", rent=6000, water=200, electricity=None,
-              miscellaneous=None, paid=True, paid_date=None, created_date=date(2026, 9, 1))
+              miscellaneous=None, paid=paid, paid_date=None, created_date=date(2026, 9, 1))
 
 
 def _complaint(status="CLOSED"):
@@ -145,9 +150,28 @@ class TenantOffboardServiceTest(unittest.TestCase):
         service, *_ = _build_service([_settled_request()], occupants=[_occupant(verified=True), _occupant(verified=True)])
         service.finalize_move_out(1, "mohan")  # must not raise
 
+    def test_finalize_blocked_by_an_unpaid_bill(self):
+        service, *_ = _build_service([_settled_request()], bills=[_bill(paid=False)])
+        with self.assertRaises(PermissionError):
+            service.finalize_move_out(1, "mohan")
+
+    def test_finalize_allowed_when_all_bills_paid(self):
+        service, *_ = _build_service([_settled_request()], bills=[_bill(paid=True), _bill(paid=True)])
+        service.finalize_move_out(1, "mohan")  # must not raise
+
+    def test_finalize_never_changes_a_bills_paid_status(self):
+        # An unpaid bill is real money owed to the owner -- freeing up a
+        # username must never make it silently disappear by marking it paid.
+        bill = _bill(paid=False)
+        service, _vacate_repo, bill_repo, *_rest = _build_service([_settled_request()], bills=[bill])
+        with self.assertRaises(PermissionError):
+            service.finalize_move_out(1, "mohan")
+        self.assertFalse(bill.paid)
+        self.assertEqual(bill_repo.saved, [])
+
     def test_finalize_archives_a_snapshot(self):
         service, vacate_repo, bill_repo, *_rest, archive_repo, user_repo = _build_service(
-            [_settled_request()], bills=[_bill()],
+            [_settled_request()], bills=[_bill(paid=True)],
         )
         result = service.finalize_move_out(1, "mohan")
         self.assertEqual(result["username"], "Room1")
@@ -159,6 +183,7 @@ class TenantOffboardServiceTest(unittest.TestCase):
         self.assertEqual(snapshot["fullName"], "Old Tenant")
         self.assertEqual(len(snapshot["bills"]), 1)
         self.assertEqual(snapshot["bills"][0]["monthYear"], "2026-09")
+        self.assertTrue(snapshot["bills"][0]["paid"])
         self.assertEqual(len(snapshot["vacateRequests"]), 1)
         self.assertEqual(snapshot["vacateRequests"][0]["settlementRefundAmount"], 9000.0)
         self.assertTrue(snapshot["vacateRequests"][0]["tenantAcknowledged"])

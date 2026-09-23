@@ -667,6 +667,15 @@ class TenantOffboardService:
         if unverified_occupants:
             raise PermissionError(f"{len(unverified_occupants)} occupant photo(s) are not yet verified. Verify them before freeing up this username.")
 
+        # An unpaid bill is real money owed to the owner -- freeing up the
+        # username must never make it disappear by silently marking it paid.
+        # The tenant has to actually pay (or the owner marks it paid once
+        # they have, the normal way) before the username can be freed.
+        bills = self.bill_repo.find_by_tenant_name_order_by_month_desc(username)
+        unpaid_bills = [b for b in bills if not b.paid]
+        if unpaid_bills:
+            raise PermissionError(f"{len(unpaid_bills)} bill(s) are still unpaid. The tenant must pay them before you can free up this username.")
+
         user = self.user_repo.find_by_username(username)
         if user is None:
             raise ValueError("Tenant account not found.")
@@ -677,7 +686,7 @@ class TenantOffboardService:
             "phone": user.phone,
             "moveInDate": user.move_in_date.isoformat() if user.move_in_date else None,
             "demandedDeposit": user.demanded_deposit,
-            "bills": [_archive_bill(b) for b in self.bill_repo.find_by_tenant_name_order_by_month_desc(username)],
+            "bills": [_archive_bill(b) for b in bills],
             "complaints": [_archive_complaint(c) for c in complaints],
             "occupants": [_archive_occupant(o) for o in occupants],
             "depositPayments": [_archive_deposit(d) for d in self.deposit_repo.find_by_tenant_order_by_date_desc(username)],

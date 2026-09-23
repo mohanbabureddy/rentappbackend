@@ -11,10 +11,12 @@ def _client(repo, deposit_repo=None, username="Room1", role="TENANT"):
     user_repo = N(find_by_username=lambda u: actor)
     empty_complaint_repo = N(find_by_tenant_name_order_by_created_desc=lambda u: [])
     empty_occupant_repo = N(find_by_tenant_username_order_by_uploaded_desc=lambda u: [])
+    empty_bill_repo = N(find_by_tenant_name_order_by_month_desc=lambda u: [])
     with mock.patch("app.routes.VacateRequestRepository", return_value=repo), \
          mock.patch("app.routes.DepositRepository", return_value=deposit_repo or _FakeDepositRepo()), \
          mock.patch("app.routes.ComplaintRepository", return_value=empty_complaint_repo), \
          mock.patch("app.routes.OccupantRepository", return_value=empty_occupant_repo), \
+         mock.patch("app.routes.TenantBillRepository", return_value=empty_bill_repo), \
          mock.patch("app.routes.get_db", return_value=object()), \
          mock.patch("app.auth.UserRepository", return_value=user_repo), \
          mock.patch("app.auth.get_db", return_value=object()):
@@ -201,12 +203,15 @@ class VacateRoutesTest(unittest.TestCase):
 
             complaint_repo = N(find_by_tenant_name_order_by_created_desc=lambda u: [N(status="OPEN"), N(status="CLOSED")])
             occupant_repo = N(find_by_tenant_username_order_by_uploaded_desc=lambda u: [N(verified=False)])
+            bill_repo = N(find_by_tenant_name_order_by_month_desc=lambda u: [N(paid=False), N(paid=True)])
             with mock.patch("app.routes.ComplaintRepository", return_value=complaint_repo), \
-                 mock.patch("app.routes.OccupantRepository", return_value=occupant_repo):
+                 mock.patch("app.routes.OccupantRepository", return_value=occupant_repo), \
+                 mock.patch("app.routes.TenantBillRepository", return_value=bill_repo):
                 r = client.get("/api/admin/vacate/settled", headers=headers)
             body = r.get_json()[0]
             self.assertEqual(body["openComplaints"], 1)
             self.assertEqual(body["unverifiedOccupants"], 1)
+            self.assertEqual(body["unpaidBills"], 1)
 
     def test_admin_listing_includes_deposit_total(self):
         repo = _FakeRepo()
