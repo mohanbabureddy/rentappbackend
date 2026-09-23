@@ -783,10 +783,13 @@ def register_routes(app: Flask) -> None:
     @app.route("/api/tenants/vacate/request", methods=["POST"])
     @require_auth
     def request_vacate():
-        service = VacateService(VacateRequestRepository(get_db()))
+        db = get_db()
+        service = VacateService(VacateRequestRepository(db), bill_repo=TenantBillRepository(db))
         try:
             return jsonify(service.request_vacate(g.current_user["username"])), 201
         except ValueError as exc:
+            return jsonify({"error": str(exc)}), 409
+        except PermissionError as exc:
             return jsonify({"error": str(exc)}), 409
 
     @app.route("/api/tenants/vacate/cancel", methods=["PUT"])

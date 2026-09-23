@@ -439,9 +439,10 @@ class VacateService:
     IST_OFFSET = timedelta(hours=5, minutes=30)
     REFUND_METHODS = ("CASH", "BANK_TRANSFER", "UPI")
 
-    def __init__(self, repo: VacateRequestRepository, deposit_repo: Optional[DepositRepository] = None):
+    def __init__(self, repo: VacateRequestRepository, deposit_repo: Optional[DepositRepository] = None, bill_repo: Optional[TenantBillRepository] = None):
         self.repo = repo
         self.deposit_repo = deposit_repo
+        self.bill_repo = bill_repo
         self.logger = logging.getLogger("app.services")
 
     def _dto(self, r: VacateRequest) -> Dict[str, Any]:
@@ -488,6 +489,10 @@ class VacateService:
     def request_vacate(self, tenant_username: str) -> Dict[str, Any]:
         if self.repo.find_open_by_tenant(tenant_username) is not None:
             raise ValueError("You already have an active vacate request.")
+        if self.bill_repo is not None:
+            unpaid = [b for b in self.bill_repo.find_by_tenant_name_order_by_month_desc(tenant_username) if not b.paid]
+            if unpaid:
+                raise PermissionError(f"You have {len(unpaid)} unpaid bill(s). Please pay them before requesting to vacate.")
         today = (utc_now() + self.IST_OFFSET).date()
         request = VacateRequest(
             tenant_username=tenant_username,

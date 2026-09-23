@@ -43,6 +43,20 @@ class _FakeDepositRepo:
         return self.totals.get(username, 0.0)
 
 
+class _FakeBillRepo:
+    def __init__(self, bills=None):
+        self.bills = bills or []
+
+    def find_by_tenant_name_order_by_month_desc(self, username):
+        return [b for b in self.bills if b.tenant_name == username]
+
+
+class _Bill:
+    def __init__(self, tenant_name, paid):
+        self.tenant_name = tenant_name
+        self.paid = paid
+
+
 class VacateServiceTest(unittest.TestCase):
     def test_request_vacate_starts_pending(self):
         svc = VacateService(_FakeRepo())
@@ -57,6 +71,32 @@ class VacateServiceTest(unittest.TestCase):
         svc.request_vacate("Room1")
         with self.assertRaises(ValueError):
             svc.request_vacate("Room1")
+
+    def test_request_vacate_blocked_by_an_unpaid_bill(self):
+        bill_repo = _FakeBillRepo([_Bill("Room1", paid=False)])
+        svc = VacateService(_FakeRepo(), bill_repo=bill_repo)
+        with self.assertRaises(PermissionError):
+            svc.request_vacate("Room1")
+
+    def test_request_vacate_allowed_when_all_bills_paid(self):
+        bill_repo = _FakeBillRepo([_Bill("Room1", paid=True), _Bill("Room1", paid=True)])
+        svc = VacateService(_FakeRepo(), bill_repo=bill_repo)
+        result = svc.request_vacate("Room1")  # must not raise
+        self.assertEqual(result["status"], "PENDING")
+
+    def test_request_vacate_skips_bill_check_when_no_bill_repo_given(self):
+        # Backward compatible -- routes that don't need this check (there
+        # aren't any today, but tests exercising the service directly
+        # shouldn't be forced to wire one up) still work.
+        svc = VacateService(_FakeRepo())
+        result = svc.request_vacate("Room1")  # must not raise
+        self.assertEqual(result["status"], "PENDING")
+
+    def test_request_vacate_only_checks_the_requesting_tenants_bills(self):
+        bill_repo = _FakeBillRepo([_Bill("Room2", paid=False)])
+        svc = VacateService(_FakeRepo(), bill_repo=bill_repo)
+        result = svc.request_vacate("Room1")  # Room2's unpaid bill must not block Room1
+        self.assertEqual(result["status"], "PENDING")
 
     def test_get_status_returns_none_with_no_request(self):
         svc = VacateService(_FakeRepo())

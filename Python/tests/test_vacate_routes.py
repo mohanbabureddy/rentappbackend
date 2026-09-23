@@ -98,6 +98,14 @@ class VacateRoutesTest(unittest.TestCase):
             r = client.get("/api/tenants/vacate/status", headers=headers)
             self.assertIsNone(r.get_json())
 
+    def test_request_blocked_by_an_unpaid_bill(self):
+        bill_repo = N(find_by_tenant_name_order_by_month_desc=lambda u: [N(paid=False)])
+        for client, headers in _client(_FakeRepo()):
+            with mock.patch("app.routes.TenantBillRepository", return_value=bill_repo):
+                r = client.post("/api/tenants/vacate/request", headers=headers)
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("unpaid bill", r.get_json()["error"])
+
     def test_cancel_with_nothing_open_is_404(self):
         for client, headers in _client(_FakeRepo()):
             r = client.put("/api/tenants/vacate/cancel", headers=headers)
