@@ -63,6 +63,27 @@ class UpdateUserClearTest(unittest.TestCase):
         self.assertIsNotNone(user.registration_code)
         self.assertEqual(r.get_json()["registrationKey"], user.registration_code)
 
+    def test_an_ordinary_edit_of_a_registered_tenant_returns_no_key(self):
+        # Regression: a registered tenant keeps a leftover registration_code, and
+        # every save used to echo it -- the admin page then wrongly popped up
+        # "is now Not Registered, take this key" after any edit.
+        user = _user()
+        user.registration_code = "OLD1-2345"
+        r = _put({"username": "Room1", "role": "TENANT", "fullName": "New Name", "registrationCompleted": True}, user)
+        self.assertEqual(r.status_code, 200)
+        self.assertIsNone(r.get_json()["registrationKey"])
+        self.assertEqual(user.registration_code, "OLD1-2345")   # and it was not regenerated
+
+    def test_editing_an_already_unregistered_tenant_does_not_reissue_the_key(self):
+        # Saving a not-yet-registered tenant without changing that must neither
+        # invalidate the key the owner already handed out nor announce a new one.
+        user = _user()
+        user.registration_completed = False
+        user.registration_code = "GIVE-N123"
+        r = _put({"registrationCompleted": False, "fullName": "Someone"}, user)
+        self.assertIsNone(r.get_json()["registrationKey"])
+        self.assertEqual(user.registration_code, "GIVE-N123")
+
     def test_status_left_alone_when_not_sent(self):
         user = _user()
         _put({"phone": "9876543210"}, user)

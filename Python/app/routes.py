@@ -347,6 +347,10 @@ def register_routes(app: Flask) -> None:
     @require_role("ADMIN")
     def update_user(user_id: int):
         data = request.get_json(silent=True) or {}
+        # Only set when THIS save resets a registered tenant to "not registered" and
+        # so creates a fresh key. It must not echo a stored key on ordinary edits:
+        # the admin page shows a "take this key" dialog whenever it sees one.
+        new_registration_key = None
         db = get_db()
         repo = UserRepository(db)
         user = repo.find_by_id(user_id)
@@ -371,6 +375,7 @@ def register_routes(app: Flask) -> None:
             # remember their own key, could register again on this username.
             if not registered and user.registration_completed and user.role == "TENANT":
                 user.registration_code = generate_registration_key()
+                new_registration_key = user.registration_code
             user.registration_completed = registered
         # Present-but-empty means "clear it"; absent means "leave it alone".
         if "fullName" in data:
@@ -393,7 +398,7 @@ def register_routes(app: Flask) -> None:
             "mail": user.mail,
             "role": user.role,
             "registrationCompleted": user.registration_completed,
-            "registrationKey": user.registration_code,
+            "registrationKey": new_registration_key,
         }), 200
 
     @app.route("/api/users/<int:user_id>/movein-deposit", methods=["PUT"])
@@ -401,7 +406,8 @@ def register_routes(app: Flask) -> None:
     def update_movein_deposit(user_id: int):
         data = request.get_json(silent=True) or {}
         db = get_db()
-        deposit_service = DepositService(DepositRepository(db), UserRepository(db))
+        # email_service: a manual deposit entry emails the tenant.
+        deposit_service = DepositService(DepositRepository(db), UserRepository(db), email_service)
         try:
             if data.get("moveInDate"):
                 deposit_service.set_move_in_date(user_id, data["moveInDate"])
@@ -437,6 +443,9 @@ def register_routes(app: Flask) -> None:
         payment_service = PaymentService(TenantBillRepository(db))
         try:
             amount = float(data.get("amount"))
+            # Refuse before any Razorpay order exists, so nobody is charged for an
+            # amount that would take the deposit past what was demanded.
+            DepositService(DepositRepository(db), UserRepository(db)).ensure_within_demanded(g.current_user["username"], amount)
             return jsonify(payment_service.create_deposit_order(g.current_user["username"], amount)), 200
         except (TypeError, ValueError) as exc:
             return jsonify({"error": str(exc) or "Invalid amount"}), 400
@@ -456,7 +465,8 @@ def register_routes(app: Flask) -> None:
             return jsonify({"error": str(exc)}), 400
         except RuntimeError as exc:
             return jsonify({"error": str(exc)}), 503
-        deposit_service = DepositService(DepositRepository(db), UserRepository(db))
+        # email_service: a paid deposit emails the tenant and the owner.
+        deposit_service = DepositService(DepositRepository(db), UserRepository(db), email_service)
         summary = deposit_service.record_payment(username, amount, data.get("paymentId"))
         return jsonify(summary), 200
 
@@ -784,7 +794,9 @@ def register_routes(app: Flask) -> None:
     @require_auth
     def request_vacate():
         db = get_db()
-        service = VacateService(VacateRequestRepository(db), bill_repo=TenantBillRepository(db))
+        # user_repo + email_service: a new request emails the owner, who has to approve it.
+        service = VacateService(VacateRequestRepository(db), bill_repo=TenantBillRepository(db),
+                                user_repo=UserRepository(db), email_service=email_service)
         try:
             return jsonify(service.request_vacate(g.current_user["username"])), 201
         except ValueError as exc:
@@ -836,7 +848,9 @@ def register_routes(app: Flask) -> None:
     def settle_vacate_request(request_id: int):
         data = request.get_json(silent=True) or {}
         db = get_db()
-        service = VacateService(VacateRequestRepository(db), DepositRepository(db))
+        # user_repo + email_service: recording the settlement emails the tenant the breakdown.
+        service = VacateService(VacateRequestRepository(db), DepositRepository(db),
+                                user_repo=UserRepository(db), email_service=email_service)
         try:
             deduction = float(data.get("deduction") or 0)
         except (TypeError, ValueError):

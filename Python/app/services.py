@@ -1,3 +1,5 @@
+import base64
+import html
 import json
 import logging
 import os
@@ -21,6 +23,18 @@ from app.vacate import calculate_vacate_date
 # these are handed from owner to incoming tenant outside the app (in person,
 # a call, a text), so they have to survive being spoken, not just typed.
 _REGISTRATION_KEY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+# Shared by every email (see EmailService._header_html/_footer_html).
+_ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+_LOGO_CID = "vgr-logo"
+_LOGO_B64: Optional[str] = None
+
+
+def _find_admin(user_repo: UserRepository) -> Optional[User]:
+    for user in user_repo.find_all():
+        if user.role == "ADMIN":
+            return user
+    return None
 
 
 def generate_registration_key() -> str:
@@ -207,10 +221,53 @@ class DepositService:
     so an admin's manual entry and a tenant's own Razorpay payment can never
     silently overwrite each other."""
 
-    def __init__(self, deposit_repo: DepositRepository, user_repo: UserRepository):
+    def __init__(self, deposit_repo: DepositRepository, user_repo: UserRepository, email_service: Optional["EmailService"] = None):
         self.deposit_repo = deposit_repo
         self.user_repo = user_repo
+        self.email_service = email_service
         self.logger = logging.getLogger("app.services")
+
+    def _notify(self, user: Optional[User], amount: float, source: str, payment_id: Optional[str], notes: Optional[str]) -> None:
+        """Best-effort email about a deposit entry that was just saved -- a mail
+        problem must never undo or fail a payment that already went through.
+        Online payments go to the tenant and the owner; a manual entry made by
+        the owner goes to the tenant only."""
+        if self.email_service is None or user is None:
+            return
+        try:
+            total = self.deposit_repo.total_for_tenant(user.username)
+            name = user.full_name or user.username
+            if source == "razorpay":
+                admin = _find_admin(self.user_repo)
+                if not user.mail and not (admin and admin.mail):
+                    self.logger.warning("Skipping deposit-paid email for '%s': no tenant or admin email on file.", user.username)
+                    return
+                self.email_service.send_deposit_paid_email(
+                    name, amount, total, user.demanded_deposit, payment_id, user.mail, admin.mail if admin else None)
+            elif user.mail:
+                self.email_service.send_manual_deposit_email(name, amount, total, user.demanded_deposit, notes, user.mail)
+            else:
+                self.logger.warning("Skipping manual-deposit email for '%s': no email on file.", user.username)
+        except Exception:
+            self.logger.exception("Failed to send deposit email for '%s'; the deposit was still recorded.", user.username)
+
+    def ensure_within_demanded(self, username: str, amount: float) -> None:
+        """A deposit can never take the total past what was demanded. Checked
+        BEFORE a Razorpay order is created, so a tenant is never charged for an
+        amount that would then have to be refused. No demanded amount set means
+        there's nothing to compare against, so no limit."""
+        user = self.user_repo.find_by_username(username)
+        if user is None or user.demanded_deposit is None:
+            return
+        demanded = float(user.demanded_deposit)
+        paid = self.deposit_repo.total_for_tenant(username)
+        remaining = round(demanded - paid, 2)
+        if remaining <= 0:
+            raise ValueError(f"The demanded deposit of ₹{demanded:.2f} has already been paid in full.")
+        if round(amount, 2) > remaining:
+            raise ValueError(
+                f"Deposit can't be more than the demanded amount. Demanded ₹{demanded:.2f}, already paid "
+                f"₹{paid:.2f}, so at most ₹{remaining:.2f} more.")
 
     def _entry_dto(self, p: DepositPayment) -> Dict[str, Any]:
         return {
@@ -260,15 +317,21 @@ class DepositService:
             raise ValueError("User not found")
         if amount <= 0:
             raise ValueError("Amount must be greater than zero")
+        self.ensure_within_demanded(user.username, amount)
         payment = DepositPayment(tenant_username=user.username, amount=amount, source="manual", notes=notes)
         self.deposit_repo.save(payment)
         self.logger.info("Admin recorded manual deposit of %s for '%s'.", amount, user.username)
+        self._notify(user, amount, "manual", None, notes)
         return self.get_summary(user.username)
 
     def record_payment(self, username: str, amount: float, payment_id: str) -> Dict[str, Any]:
+        # Deliberately NOT limit-checked here: by now Razorpay has verified and
+        # taken the money, so it must be recorded. The limit is enforced when the
+        # order is created (see ensure_within_demanded).
         payment = DepositPayment(tenant_username=username, amount=amount, source="razorpay", payment_id=payment_id)
         self.deposit_repo.save(payment)
         self.logger.info("Recorded deposit payment of %s for '%s' (payment_id=%s).", amount, username, payment_id)
+        self._notify(self.user_repo.find_by_username(username), amount, "razorpay", payment_id, None)
         return self.get_summary(username)
 
 
@@ -439,11 +502,49 @@ class VacateService:
     IST_OFFSET = timedelta(hours=5, minutes=30)
     REFUND_METHODS = ("CASH", "BANK_TRANSFER", "UPI")
 
-    def __init__(self, repo: VacateRequestRepository, deposit_repo: Optional[DepositRepository] = None, bill_repo: Optional[TenantBillRepository] = None):
+    def __init__(self, repo: VacateRequestRepository, deposit_repo: Optional[DepositRepository] = None, bill_repo: Optional[TenantBillRepository] = None,
+                 user_repo: Optional[UserRepository] = None, email_service: Optional["EmailService"] = None):
         self.repo = repo
         self.deposit_repo = deposit_repo
         self.bill_repo = bill_repo
+        self.user_repo = user_repo
+        self.email_service = email_service
         self.logger = logging.getLogger("app.services")
+
+    def _notify_tenant_of_settlement(self, request: VacateRequest, deposited: float) -> None:
+        """Best-effort: the tenant is owed the breakdown, but a mail problem
+        must never undo a settlement the owner has already recorded."""
+        if self.email_service is None or self.user_repo is None:
+            return
+        try:
+            tenant = self.user_repo.find_by_username(request.tenant_username)
+            if tenant is None or not tenant.mail:
+                self.logger.warning("Skipping settlement email for '%s': no email on file.", request.tenant_username)
+                return
+            self.email_service.send_settlement_email(
+                tenant.full_name or tenant.username, request.vacate_date.isoformat(), deposited,
+                request.settlement_deduction, request.settlement_refund_amount,
+                request.settlement_refund_method, request.settlement_note, tenant.mail)
+        except Exception:
+            self.logger.exception("Failed to send settlement email for '%s'; the settlement was still recorded.", request.tenant_username)
+
+    def _notify_admin_of_request(self, request: VacateRequest) -> None:
+        """Best-effort: the owner has to approve this, so they should hear about
+        it -- but a mail problem must never lose the tenant's request."""
+        if self.email_service is None or self.user_repo is None:
+            return
+        try:
+            admin = _find_admin(self.user_repo)
+            if admin is None or not admin.mail:
+                self.logger.warning("Skipping vacate-request email for '%s': no admin email on file.", request.tenant_username)
+                return
+            tenant = self.user_repo.find_by_username(request.tenant_username)
+            name = (tenant.full_name if tenant and tenant.full_name else request.tenant_username)
+            self.email_service.send_vacate_requested_email(
+                f"{name} ({request.tenant_username})" if name != request.tenant_username else name,
+                request.requested_date.isoformat(), request.vacate_date.isoformat(), admin.mail)
+        except Exception:
+            self.logger.exception("Failed to send vacate-request email for '%s'; the request was still saved.", request.tenant_username)
 
     def _dto(self, r: VacateRequest) -> Dict[str, Any]:
         return {
@@ -502,6 +603,7 @@ class VacateService:
         )
         saved = self.repo.save(request)
         self.logger.info("Tenant %s requested to vacate; calculated date %s (pending owner approval).", tenant_username, saved.vacate_date)
+        self._notify_admin_of_request(saved)
         return self._dto(saved)
 
     def cancel_vacate(self, tenant_username: str) -> None:
@@ -581,6 +683,7 @@ class VacateService:
             "Settled vacate request %s for tenant %s: deposited=%s deduction=%s refund=%s method=%s.",
             saved.id, saved.tenant_username, deposited, deduction, saved.settlement_refund_amount, refund_method,
         )
+        self._notify_tenant_of_settlement(saved, deposited)
         return self._dto(saved)
 
 
@@ -916,7 +1019,10 @@ class EmailService:
             "text": body,
         }
         if html_body:
+            payload["text"] = body + self._footer_text()
             payload["html"] = html_body
+            if f"cid:{_LOGO_CID}" in html_body:
+                payload["attachments"] = [self._logo_attachment()]
 
         self.logger.info("Sending email to %s via Resend. subject=%s sender=%s", recipient, subject, settings["sender"])
         try:
@@ -940,22 +1046,66 @@ class EmailService:
         miscellaneous = bill.miscellaneous or 0
         return rent + water + electricity + miscellaneous
 
-    def _brand_logo(self) -> str:
-        return """
-        <svg width="420" height="210" viewBox="0 0 420 210" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="VGR logo">
-          <g fill="none" fill-rule="evenodd">
-            <g transform="translate(42,16)">
-              <circle cx="160" cy="90" r="92" stroke="#3e2a1d" stroke-width="12" fill="none"/>
-              <g stroke="#3e2a1d" stroke-linecap="round" stroke-width="12">
-                <path d="M25 90H15M295 90H305M160 2V-8M160 178V188M66 35L58 27M262 153L270 161M66 145L58 153M262 27L270 19"/>
-              </g>
-              <path d="M147 60c28 2 45 18 45 42 0 31-27 54-58 54-26 0-45-15-54-40 10 15 27 25 46 25 20 0 38-11 48-29 8-15 10-30 7-52h-34z" fill="#3e2a1d"/>
-              <path d="M147 80c30 1 47 15 47 38 0 25-21 44-48 44-18 0-32-8-42-22 9 10 20 16 34 16 23 0 41-15 44-38 2-15-2-30-17-38h-18z" fill="#3e2a1d" opacity="0.9"/>
-              <path d="M128 71c26 5 44 22 49 49-9 5-18 9-29 10-23 2-42-7-55-28 4-16 16-31 35-31z" fill="#3e2a1d"/>
-            </g>
-          </g>
-        </svg>
-        """
+    @staticmethod
+    def _subject(text: str) -> str:
+        """Every email's subject starts with the brand, so it's recognisable in an inbox."""
+        return f"VGR: {text}"
+
+    def _logo_attachment(self) -> Dict[str, str]:
+        """The logo goes out as an inline image attachment referenced by
+        cid:vgr-logo. The old inline <svg> was stripped by Gmail and Outlook,
+        so it never showed; an attached image renders everywhere."""
+        global _LOGO_B64
+        if _LOGO_B64 is None:
+            _LOGO_B64 = base64.b64encode((_ASSETS_DIR / "vgr_header.png").read_bytes()).decode("ascii")
+        return {"filename": "vgr-logo.png", "content": _LOGO_B64, "content_type": "image/png", "content_id": _LOGO_CID}
+
+    def _header_html(self) -> str:
+        return (
+            '<div style="text-align: center; margin: 0 0 24px;">'
+            f'<img src="cid:{_LOGO_CID}" alt="VGR" width="380" '
+            'style="display: block; margin: 0 auto; width: 380px; max-width: 100%; height: auto; border: 0;">'
+            "</div>"
+        )
+
+    def _owner_details(self) -> Dict[str, Any]:
+        """Owner name, address and phone for the footer of every email. These
+        come from settings (MAIL_OWNER_NAME, MAIL_ADDRESS with lines separated
+        by "|", MAIL_PHONE), not from code -- the repos are public, and a
+        personal address/phone shouldn't be committed to them. Re-read on
+        every call, like the mail key, so a changed value needs no code edit."""
+        env_values = self._load_dotenv()
+
+        def setting(key: str) -> str:
+            return (os.getenv(key) or env_values.get(key) or "").strip()
+
+        return {
+            "name": setting("MAIL_OWNER_NAME"),
+            "address": [ln.strip() for ln in re.split(r"[|\n]", setting("MAIL_ADDRESS")) if ln.strip()],
+            "phone": setting("MAIL_PHONE"),
+        }
+
+    def _footer_text(self) -> str:
+        d = self._owner_details()
+        lines = ([d["name"]] if d["name"] else []) + d["address"] + ([f"Phone: {d['phone']}"] if d["phone"] else [])
+        return "\n\n--\n" + "\n".join(lines) if lines else ""
+
+    def _footer_html(self) -> str:
+        """Owner name, address and phone at the bottom of every email. Anything
+        not configured is simply left out; with nothing configured, no footer."""
+        d = self._owner_details()
+        parts = []
+        if d["name"]:
+            parts.append(f"<strong>{html.escape(d['name'])}</strong>")
+        parts.extend(html.escape(ln) for ln in d["address"])
+        if d["phone"]:
+            parts.append(f"Phone: {html.escape(d['phone'])}")
+        if not parts:
+            return ""
+        return (
+            '<div style="margin-top: 24px; padding-top: 14px; border-top: 1px solid #3e2a1d33; '
+            f'text-align: center; color: #6b5a4d; font-size: 13px; line-height: 1.6;">{"<br>".join(parts)}</div>'
+        )
 
     def _bill_template(self, bill: TenantBill, tenant_name: str, title: str, message: str, footer: str) -> str:
         total = self._invoice_total(bill)
@@ -987,8 +1137,7 @@ class EmailService:
         <html>
           <body style="font-family: Arial, sans-serif; color: #1f2937; line-height: 1.6; background-color: #efe8dd; padding: 24px; margin: 0;">
             <div style="max-width: 760px; margin: 0 auto; background: #efe8dd; border: 3px solid #3e2a1d; padding: 28px 24px 24px;">
-              <div style="text-align: center; margin-bottom: 12px;">{self._brand_logo()}</div>
-              <div style="font-size: 120px; font-weight: 900; letter-spacing: -8px; line-height: 0.9; text-align: center; color: #3e2a1d; margin: 0 0 28px;">VGR</div>
+              {self._header_html()}
 
               <h2 style="margin: 0 0 12px; color: #111827; font-size: 24px;">{title}</h2>
               <p style="margin: 0 0 20px; font-size: 15px;">Hello {tenant_name},</p>
@@ -1011,20 +1160,120 @@ class EmailService:
               </table>
 
               <p style="margin: 0; color: #374151; font-size: 15px;">{footer}</p>
+              {self._footer_html()}
             </div>
           </body>
         </html>
         """
 
+    def _notice_template(self, title: str, greeting_name: Optional[str], message: str, rows: List[tuple], footer: str) -> str:
+        """Same look as the bill emails, for notices that aren't a bill:
+        a heading, a message, and a small label/value table."""
+        row_html = "".join(
+            f"""
+                <tr>
+                  <td style="padding: 10px 14px; border-bottom: 1px solid #e5e7eb;"><strong>{html.escape(str(label))}</strong></td>
+                  <td style="padding: 10px 14px; border-bottom: 1px solid #e5e7eb; text-align: right;">{html.escape(str(value))}</td>
+                </tr>"""
+            for label, value in rows
+        )
+        return f"""
+        <html>
+          <body style="font-family: Arial, sans-serif; color: #1f2937; line-height: 1.6; background-color: #efe8dd; padding: 24px; margin: 0;">
+            <div style="max-width: 760px; margin: 0 auto; background: #efe8dd; border: 3px solid #3e2a1d; padding: 28px 24px 24px;">
+              {self._header_html()}
+              <h2 style="margin: 0 0 12px; color: #111827; font-size: 24px;">{html.escape(title)}</h2>
+              <p style="margin: 0 0 20px; font-size: 15px;">{("Hello " + html.escape(greeting_name) + ",") if greeting_name else "Hello,"}</p>
+              <p style="margin: 0 0 20px; font-size: 15px;">{html.escape(message)}</p>
+              <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px; background: #ffffff; border: 1px solid #e5e7eb;">{row_html}
+              </table>
+              <p style="margin: 0; color: #374151; font-size: 15px;">{html.escape(footer)}</p>
+              {self._footer_html()}
+            </div>
+          </body>
+        </html>
+        """
+
+    def send_deposit_paid_email(self, tenant_name: str, amount: float, total: float, demanded: Optional[float],
+                                payment_id: Optional[str], tenant_email: Optional[str], admin_email: Optional[str]) -> None:
+        """An online (Razorpay) deposit payment -- goes to the tenant and the owner."""
+        subject = self._subject(f"Deposit payment received from {tenant_name} - ₹{amount:.2f}")
+        message = f"A security deposit payment of ₹{amount:.2f} from {tenant_name} has been received."
+        rows = [("Tenant", tenant_name), ("Amount paid", f"₹{amount:.2f}"), ("Total deposit paid", f"₹{total:.2f}")]
+        if demanded is not None:
+            rows.append(("Deposit demanded", f"₹{demanded:.2f}"))
+            rows.append(("Remaining", f"₹{max(demanded - total, 0):.2f}"))
+        if payment_id:
+            rows.append(("Payment ID", payment_id))
+        body = message + "\n" + "\n".join(f"{k}: {v}" for k, v in rows)
+        sent_to = set()
+        for recipient, name in ((tenant_email, tenant_name), (admin_email, "Owner")):
+            if recipient and recipient not in sent_to:
+                sent_to.add(recipient)
+                html_body = self._notice_template("Deposit Payment Received", name, message, rows, "Thank you.")
+                self._send_email(recipient, subject, body, html_body)
+
+    def send_manual_deposit_email(self, tenant_name: str, amount: float, total: float, demanded: Optional[float],
+                                  notes: Optional[str], tenant_email: str) -> None:
+        """The owner recorded a deposit the tenant paid outside the app (cash etc.) -- tenant only."""
+        subject = self._subject(f"Deposit of ₹{amount:.2f} recorded")
+        message = f"The owner has recorded a security deposit of ₹{amount:.2f} for you."
+        rows = [("Amount recorded", f"₹{amount:.2f}"), ("Total deposit paid", f"₹{total:.2f}")]
+        if demanded is not None:
+            rows.append(("Deposit demanded", f"₹{demanded:.2f}"))
+            rows.append(("Remaining", f"₹{max(demanded - total, 0):.2f}"))
+        if notes:
+            rows.append(("Note", notes))
+        body = message + "\n" + "\n".join(f"{k}: {v}" for k, v in rows)
+        html_body = self._notice_template("Deposit Recorded", tenant_name, message, rows,
+                                          "If this doesn't match what you paid, please contact the owner.")
+        self._send_email(tenant_email, subject, body, html_body)
+
+    _REFUND_METHOD_LABELS = {"CASH": "Cash", "BANK_TRANSFER": "Bank transfer", "UPI": "UPI / Mobile"}
+
+    def send_settlement_email(self, tenant_name: str, vacate_date: str, deposit: float, deduction: float,
+                              refund: float, method: str, note: Optional[str], tenant_email: str) -> None:
+        """The owner recorded the full and final settlement -- the tenant gets the
+        whole breakdown and is asked to confirm they received the refund."""
+        subject = self._subject(f"Full and final settlement - refund of ₹{refund:.2f}")
+        message = "Your move-out has been settled. Here is the full and final settlement of your security deposit."
+        rows = [
+            ("Move-out date", vacate_date),
+            ("Total deposit paid", f"₹{deposit:.2f}"),
+            ("Deducted (damages / dues)", f"₹{deduction:.2f}"),
+            ("Refund to you", f"₹{refund:.2f}"),
+            ("Refund method", self._REFUND_METHOD_LABELS.get(method, method)),
+        ]
+        if note:
+            rows.append(("Note from owner", note))
+        body = message + "\n" + "\n".join(f"{k}: {v}" for k, v in rows)
+        html_body = self._notice_template(
+            "Full and Final Settlement", tenant_name, message, rows,
+            "Please log in and confirm that you have received your refund. If anything here looks wrong, contact the owner.")
+        self._send_email(tenant_email, subject, body, html_body)
+
+    def send_vacate_requested_email(self, tenant_name: str, requested_date: str, vacate_date: str, admin_email: str) -> None:
+        """A tenant asked to move out -- goes to the owner, who has to approve it."""
+        subject = self._subject(f"Vacate request from {tenant_name}")
+        message = f"{tenant_name} has requested to vacate and is waiting for your approval."
+        rows = [("Tenant", tenant_name), ("Requested on", requested_date), ("Proposed move-out date", vacate_date)]
+        body = message + "\n" + "\n".join(f"{k}: {v}" for k, v in rows)
+        html_body = self._notice_template("New Vacate Request", "Owner", message, rows,
+                                          "Open Vacate Requests in the app to approve it.")
+        self._send_email(admin_email, subject, body, html_body)
+
     def send_otp_email(self, recipient: str, otp: str) -> None:
-        subject = "Your OTP code"
+        subject = self._subject("Your OTP code")
         body = f"Your OTP is {otp}. It will expire in 5 minutes.\n\nIf you did not request this, you can ignore this email."
-        self._send_email(recipient, subject, body)
+        html_body = self._notice_template(
+            "Your OTP Code", None, "Use this one-time code to continue. It expires in 5 minutes.",
+            [("OTP", otp)], "If you did not request this, you can ignore this email.")
+        self._send_email(recipient, subject, body, html_body)
 
     def notify_bill_generated(self, bill: TenantBill, tenant_email: Optional[str], month: str) -> None:
         if tenant_email:
             label = "Electricity" if bill.bill_type == "ELECTRICITY" else "Rent"
-            subject = f"{label} bill generated for {month}"
+            subject = self._subject(f"{label} bill generated for {month} - {bill.tenant_name}")
             body = (
                 f"Hello,\n\nYour {label.lower()} bill for {month} has been generated.\n"
                 f"Amount due: ₹{self._invoice_total(bill):.2f}\n\nThank you."
@@ -1039,7 +1288,8 @@ class EmailService:
             self._send_email(tenant_email, subject, body, html_body)
 
     def send_bill_paid_email(self, bill: TenantBill, tenant_email: str, admin_email: str) -> None:
-        subject = f"Payment received for {bill.month_year}"
+        label = "Electricity" if bill.bill_type == "ELECTRICITY" else "Rent"
+        subject = self._subject(f"{label} payment received for {bill.month_year} - {bill.tenant_name}")
         body = (
             f"Hello,\n\nYour payment for {bill.month_year} has been received successfully.\n"
             f"Paid amount: ₹{self._invoice_total(bill):.2f}\n\nThank you."

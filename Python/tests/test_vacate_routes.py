@@ -18,6 +18,7 @@ def _client(repo, deposit_repo=None, username="Room1", role="TENANT"):
          mock.patch("app.routes.OccupantRepository", return_value=empty_occupant_repo), \
          mock.patch("app.routes.TenantBillRepository", return_value=empty_bill_repo), \
          mock.patch("app.routes.get_db", return_value=object()), \
+         mock.patch("app.routes.UserRepository", return_value=N(find_all=lambda: [], find_by_username=lambda u: None)), \
          mock.patch("app.auth.UserRepository", return_value=user_repo), \
          mock.patch("app.auth.get_db", return_value=object()):
         headers = {"Authorization": "Bearer " + generate_token(username, role, 0)}

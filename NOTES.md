@@ -88,3 +88,13 @@ Always build this field with an explicit forward-slash f-string.
 - Frontend: `npm start` reads the API address from `frontend/.env.development`; the production
   build takes `REACT_APP_API_BASE` from Render.
 - Running the local backend: `python -m flask --app app run --port 5000` (needs MySQL running).
+
+## Owner details in every email (set on Render too)
+
+The name/address/phone in the footer of every email come from three env vars,
+not from code (both repos are public, so a personal address and phone must
+not be committed): `MAIL_OWNER_NAME`, `MAIL_ADDRESS` (lines separated by `|`)
+and `MAIL_PHONE`. Locally they live in `Python/.env`. On Render they must be
+added to the backend service's Environment and then followed by a real deploy
+(see the env-var note above) -- until then production emails simply have no
+footer. Anything left unset is just omitted.
