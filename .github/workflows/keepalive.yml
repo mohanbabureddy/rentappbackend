@@ -1,0 +1,40 @@
+name: Keep backend and database awake
+
+# Render puts a free web service to sleep after ~15 minutes with no outside
+# request, and Supabase pauses a project after a week with no activity. This
+# calls /api/health (which runs a trivial database query) every 10 minutes,
+# which stops both. A thread inside the app can't do this: Render only counts
+# outside requests, and a sleeping service takes its threads with it.
+#
+# Setup (once): repo Settings > Secrets and variables > Actions > Variables >
+# New repository variable  BACKEND_URL  =  https://<your-backend>.onrender.com
+# (no trailing slash). Until it's set this job does nothing and says so.
+#
+# Only the BACKEND is pinged. The frontend is static -- letting it sleep is
+# fine, and keeping two free services awake around the clock can use up
+# Render's monthly free instance hours.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Call /api/health
+        env:
+          BACKEND_URL: ${{ vars.BACKEND_URL }}
+        run: |
+          if [ -z "$BACKEND_URL" ]; then
+            echo "::warning::BACKEND_URL is not set (repo Settings > Secrets and variables > Actions > Variables). Nothing was pinged."
+            exit 0
+          fi
+          # A sleeping Render service can take a minute to wake, so allow a long
+          # first response and retry before calling it a failure.
+          curl --fail --silent --show-error \
+               --max-time 90 --retry 3 --retry-delay 15 --retry-all-errors \
+               "${BACKEND_URL%/}/api/health"
+          echo

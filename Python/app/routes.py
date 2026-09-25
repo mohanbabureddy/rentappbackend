@@ -61,6 +61,22 @@ def register_routes(app: Flask) -> None:
             "startedAt": started_at,
         }), 200
 
+    @app.route("/api/health", methods=["GET"])
+    def health():
+        """Called every ~10 minutes by an outside pinger (.github/workflows/keepalive.yml).
+        It does two jobs in one request: the request itself stops Render putting the
+        service to sleep, and the SELECT 1 counts as database activity so Supabase
+        doesn't pause the project. No data is read or returned. (A thread inside the app
+        can't do either: Render only counts outside requests, and a sleeping service
+        takes its threads with it.)"""
+        from sqlalchemy import text
+        try:
+            get_db().execute(text("SELECT 1"))
+        except Exception:
+            logger.exception("Health check: database is not reachable.")
+            return jsonify({"status": "degraded", "database": "down"}), 503
+        return jsonify({"status": "ok", "database": "up"}), 200
+
     @app.route("/api/auth/login", methods=["POST"])
     def auth_login():
         data = request.get_json(silent=True) or {}
