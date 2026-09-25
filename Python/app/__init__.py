@@ -55,6 +55,8 @@ _ALLOWED_ORIGINS = [
     "https://vgrpay.uk",
     "https://d8aff7a8.rentapp1.pages.dev",
     "https://rentappfrontend.onrender.com",
+    # Free Static Site that replaces the Docker web service (which slept after 15 idle minutes).
+    "https://rentapp-web-ympg.onrender.com",
 ]
 CORS(
     app,
