@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import sys
 from logging.handlers import RotatingFileHandler
 
@@ -58,6 +59,9 @@ _ALLOWED_ORIGINS = [
     # Free Static Site that replaces the Docker web service (which slept after 15 idle minutes).
     "https://rentapp-web-ympg.onrender.com",
 ]
+if os.getenv("APP_ENV") == "local":
+    # Testing from a phone on the home Wi-Fi: http://192.168.x.x:3000 (never allowed in production).
+    _ALLOWED_ORIGINS.append(re.compile(r"^http://192\.168\.\d{1,3}\.\d{1,3}:3000$"))
 CORS(
     app,
     # /uploads/* also needs CORS -- it's fetched cross-origin with an
@@ -117,6 +121,7 @@ _LATER_COLUMNS = [
     ("vacate_requests", "settlement_note", "VARCHAR(500)"),
     ("vacate_requests", "settled_date", "DATETIME"),
     ("users", "registration_code", "VARCHAR(20)"),
+    ("tenant_bills", "paid_via", "VARCHAR(20)"),
     ("vacate_requests", "tenant_acknowledged", "INTEGER NOT NULL DEFAULT 0"),
     ("vacate_requests", "tenant_feedback", "TEXT"),
     ("vacate_requests", "acknowledged_date", "DATETIME"),

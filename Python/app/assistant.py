@@ -287,9 +287,9 @@ class AssistantService:
             )
 
         admin_block = (
-            f"Property manager / owner contact: name={admin.full_name or admin.username}, "
+            f"Owner contact (always call this person 'the owner', never 'admin'): name={admin.full_name or admin.username}, "
             f"email={admin.mail or 'not on file'}, phone={admin.phone or 'not on file'}."
-            if admin else "No admin contact is on file."
+            if admin else "No owner contact is on file."
         )
 
         demanded = tenant.demanded_deposit

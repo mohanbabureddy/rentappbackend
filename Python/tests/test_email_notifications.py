@@ -254,7 +254,7 @@ class EmailContentTest(unittest.TestCase):
         recipient, subject, body, html_body = self.sent[0]
         self.assertEqual(recipient, "t@x.com")
         self.assertIn("17500.00", subject)
-        for expected in ("20000.00", "2500.00", "17500.00", "Bank transfer", "2026-11-08"):
+        for expected in ("20000.00", "2500.00", "17500.00", "Bank transfer", "08/11/2026"):
             self.assertIn(expected, body)
         self.assertIn("confirm", html_body)
         self.assertIn("Paint &lt;b&gt;", html_body)   # owner's note is escaped
@@ -264,7 +264,7 @@ class EmailContentTest(unittest.TestCase):
         recipient, subject, body, html_body = self.sent[0]
         self.assertEqual(recipient, "o@x.com")
         self.assertIn("Ravindra (Room1)", subject)
-        self.assertIn("2026-11-08", body)
+        self.assertIn("08/11/2026", body)
 
 
 

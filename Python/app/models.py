@@ -88,6 +88,8 @@ class TenantBill(Base):
     miscellaneous = Column(Float, nullable=True)
     paid = Column(BitBoolean, default=False, nullable=False)
     paid_date = Column(DateTime, nullable=True)
+    # "ONLINE" (tenant paid via Razorpay) or "OWNER" (owner marked it paid after a cash/manual payment); NULL on older bills.
+    paid_via = Column(String(20), nullable=True)
     created_date = Column(Date, nullable=True)
 
 

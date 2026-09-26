@@ -356,13 +356,14 @@ class TenantBillService:
                 return user
         return None
 
-    def mark_paid(self, bill_id: int) -> str:
+    def mark_paid(self, bill_id: int, paid_via: str = "ONLINE") -> str:
         bill = self.repo.find_by_id(bill_id)
         if bill is None:
             self.logger.warning("Mark-paid failed: bill %s not found.", bill_id)
             raise ValueError("Bill not found")
         bill.paid = True
         bill.paid_date = utc_now()
+        bill.paid_via = paid_via
         self.repo.save(bill)
         self.logger.info("Marked bill %s as paid for tenant %s (%s).", bill_id, bill.tenant_name, bill.month_year)
         if self.email_service is not None:
@@ -972,6 +973,17 @@ class TransactionService:
         return saved
 
 
+def format_dmy(value) -> str:
+    """Every date people read is day/month/year (25/09/2026); the database and API keep ISO."""
+    if hasattr(value, "strftime"):
+        return value.strftime("%d/%m/%Y")
+    text = str(value or "")
+    try:
+        return datetime.strptime(text[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError:
+        return text
+
+
 class EmailService:
     def __init__(self) -> None:
         self.logger = logging.getLogger("app.email")
@@ -1238,7 +1250,7 @@ class EmailService:
         subject = self._subject(f"Full and final settlement - refund of ₹{refund:.2f}")
         message = "Your move-out has been settled. Here is the full and final settlement of your security deposit."
         rows = [
-            ("Move-out date", vacate_date),
+            ("Move-out date", format_dmy(vacate_date)),
             ("Total deposit paid", f"₹{deposit:.2f}"),
             ("Deducted (damages / dues)", f"₹{deduction:.2f}"),
             ("Refund to you", f"₹{refund:.2f}"),
@@ -1256,7 +1268,8 @@ class EmailService:
         """A tenant asked to move out -- goes to the owner, who has to approve it."""
         subject = self._subject(f"Vacate request from {tenant_name}")
         message = f"{tenant_name} has requested to vacate and is waiting for your approval."
-        rows = [("Tenant", tenant_name), ("Requested on", requested_date), ("Proposed move-out date", vacate_date)]
+        rows = [("Tenant", tenant_name), ("Requested on", format_dmy(requested_date)),
+                ("Proposed move-out date", format_dmy(vacate_date))]
         body = message + "\n" + "\n".join(f"{k}: {v}" for k, v in rows)
         html_body = self._notice_template("New Vacate Request", "Owner", message, rows,
                                           "Open Vacate Requests in the app to approve it.")

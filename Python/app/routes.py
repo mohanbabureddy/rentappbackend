@@ -517,6 +517,7 @@ def register_routes(app: Flask) -> None:
                 "miscellaneous": b.miscellaneous,
                 "paid": b.paid,
                 "paidDate": to_iso_utc(b.paid_date),
+                "paidVia": b.paid_via,
                 "createdDate": b.created_date.isoformat() if b.created_date else None,
             }
             for b in bills
@@ -570,6 +571,20 @@ def register_routes(app: Flask) -> None:
             return jsonify({"message": service.mark_paid(bill_id)}), 200
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 404
+
+    @app.route("/api/tenants/markPaidByOwner/<int:bill_id>", methods=["PUT"])
+    @require_role("ADMIN")
+    def mark_paid_by_owner(bill_id: int):
+        """The owner received the money outside the app (cash, UPI...) and records it."""
+        db = get_db()
+        repo = TenantBillRepository(db)
+        bill = repo.find_by_id(bill_id)
+        if bill is None:
+            return jsonify({"error": "Bill not found"}), 404
+        if bill.paid:
+            return jsonify({"error": "This bill is already paid."}), 400
+        service = TenantBillService(repo, UserRepository(db), email_service)
+        return jsonify({"message": service.mark_paid(bill_id, "OWNER")}), 200
 
     @app.route("/api/tenants/addBill", methods=["POST"])
     @require_role("ADMIN")
@@ -649,6 +664,7 @@ def register_routes(app: Flask) -> None:
                 "miscellaneous": b.miscellaneous,
                 "paid": b.paid,
                 "paidDate": to_iso_utc(b.paid_date),
+                "paidVia": b.paid_via,
                 "createdDate": b.created_date.isoformat() if b.created_date else None,
             }
             for b in bills

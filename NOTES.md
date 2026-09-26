@@ -98,3 +98,34 @@ and `MAIL_PHONE`. Locally they live in `Python/.env`. On Render they must be
 added to the backend service's Environment and then followed by a real deploy
 (see the env-var note above) -- until then production emails simply have no
 footer. Anything left unset is just omitted.
+
+## Backing up production to this laptop (database + uploaded files, daily)
+
+`Python/scripts/backup-prod.ps1` copies production (Supabase) to this laptop:
+every table into a NEW local MySQL schema `rent_app_prod_backup_<date>_<time>`
+(never `rent_app`), and the Aadhaar uploads into `%USERPROFILE%\RentAppBackups\aadhaar`
+-- deliberately OUTSIDE OneDrive so ID documents never sync to the cloud (the
+script refuses any folder inside OneDrive). Production is only read. Files are
+mirrored: unchanged ones are skipped and files deleted from production are kept.
+The newest 14 auto-named schemas are kept, older ones dropped. Log:
+`%USERPROFILE%\RentAppBackups\backup.log`.
+
+One-time setup (asks for 3 values, hidden; stores them encrypted for this Windows
+account only, tests them read-only, then schedules the task):
+
+    powershell -File Python\scripts\setup-backup-schedule.ps1
+
+  - `PROD_DATABASE_URL`: Supabase > Connect > **Session pooler** URI (the direct
+    connection is IPv6-only and fails on many home networks)
+  - `SUPABASE_URL` and `SUPABASE_SERVICE_KEY`: same values as on Render
+
+It then runs 5 minutes after you log in and daily at 1 PM (catching up if the
+laptop was off), at most one successful backup per day. By hand:
+
+    powershell -File Python\scripts\backup-prod.ps1 -Check   # look only, writes nothing
+    powershell -File Python\scripts\backup-prod.ps1          # backup now
+    powershell -File Python\scripts\setup-backup-schedule.ps1 -Remove -ForgetSecrets
+
+Needs the local MySQL running. A backup holds real tenant data, password hashes
+and registration keys -- keep it on this laptop only. Never save the connection
+URL or service key in a file inside this OneDrive folder.
